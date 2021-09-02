@@ -30,6 +30,14 @@ extern "C" {
     #include "lwip/pbuf.h"
 }
 
+
+//CONFIG_ASYNC_TCP_DIAGNOSTICS
+//#define CONFIG_ASYNC_TCP_DIAGNOSTICS 1
+
+#ifndef CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE
+#define CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE (CONFIG_LWIP_MAX_ACTIVE_TCP * 2)
+#endif
+
 //If core is not defined, then we are running in Arduino or PIO
 #ifndef CONFIG_ASYNC_TCP_RUNNING_CORE
 #define CONFIG_ASYNC_TCP_RUNNING_CORE -1 //any available core
@@ -39,6 +47,16 @@ extern "C" {
 #ifndef CONFIG_ASYNC_TCP_USE_WDT
 #define CONFIG_ASYNC_TCP_USE_WDT 1 //if enabled, adds between 33us and 200us per event
 #endif
+
+//the number of words (esp32 1 word = 4 bytes) of stack space to allocate
+#ifndef CONFIG_ASYNC_TCP_TASK_STACK_SIZE
+#define CONFIG_ASYNC_TCP_TASK_STACK_SIZE (8192)
+#endif
+
+#ifndef CONFIG_ASYNC_TCP_TASK_PRIORITY
+#define CONFIG_ASYNC_TCP_TASK_PRIORITY 3
+#endif
+
 
 class AsyncClient;
 
@@ -129,6 +147,15 @@ class AsyncClient {
 
     const char * errorToString(int8_t error);
     const char * stateToString();
+  
+    #if CONFIG_ASYNC_TCP_DIAGNOSTICS
+    // Gets the async_tcp task's minimum amount of remaining stack space that was 
+    // available to the task since the task started executing - - that is the amount
+    // of stack that remained unused when the task stack was at its greatest (deepest)
+    // value. This is what is referred to as the stack 'high water mark'.
+    // See https://www.freertos.org/uxTaskGetStackHighWaterMark.html
+    static UBaseType_t getStackHighWaterMark();
+    #endif
 
     //Do not use any of the functions below!
     static int8_t _s_poll(void *arg, struct tcp_pcb *tpcb);
@@ -164,12 +191,12 @@ class AsyncClient {
     AcConnectHandler _poll_cb;
     void* _poll_cb_arg;
 
-    bool _pcb_busy;
-    uint32_t _pcb_sent_at;
     bool _ack_pcb;
+    uint32_t _tx_last_packet;
     uint32_t _rx_ack_len;
     uint32_t _rx_last_packet;
-    uint32_t _rx_since_timeout;
+    uint32_t _rx_timeout;
+    uint32_t _rx_last_ack;
     uint32_t _ack_timeout;
     uint16_t _connect_port;
 
