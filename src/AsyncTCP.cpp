@@ -721,7 +721,9 @@ bool AsyncClient::connect(IPAddress ip, uint16_t port){
     tcp_sent(pcb, &_tcp_sent);
     tcp_poll(pcb, &_tcp_poll, 1);
     //_tcp_connect(pcb, &addr, port,(tcp_connected_fn)&_s_connected);
-    _tcp_connect(pcb, _closed_slot, &addr, port,(tcp_connected_fn)&_tcp_connected);
+    if (ESP_OK != _tcp_connect(pcb, _closed_slot, &addr, port,(tcp_connected_fn)&_tcp_connected)){
+        return false;
+    }
     return true;
 }
 
