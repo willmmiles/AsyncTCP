@@ -2,6 +2,14 @@
 
 Newest at top
 
+## 2021-09-02 - Check for error on connect and return false if the connection failed
+
+**Commit**: [c4d43765217a67f8394bf946336ce55a13aef31a](https://github.com/pbolduc/AsyncTCP/commit/c4d43765217a67f8394bf946336ce55a13aef31a)
+
+Original fix, see [BlueAndi/AsyncTCP](https://github.com/BlueAndi/AsyncTCP/commit/ce2e7949d9694a8b10379c39d101ce55c2a8a287)'s commit
+
+* _tcp_connect can return ESP_OK or an error. This change will return false if the _tcp_connect is not successful. Applications could wait for a long time if they believe the connection was successful.
+
 ## 2021-09-01 - Added CHANGELOG.md
 
 * added this document
