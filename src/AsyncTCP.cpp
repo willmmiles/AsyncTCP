@@ -72,7 +72,7 @@ struct lwip_event_packet_t {
         } accept;
         struct {
                 const char * name;
-                ip_addr_t addr;
+                ip_addr_t* addr;
         } dns;
     };
 
@@ -138,6 +138,9 @@ static void _handle_async_event(lwip_event_packet_t& e){
     if(e.arg == NULL){
         // do nothing when arg is NULL
         //ets_printf("event arg == NULL: 0x%08x\n", e.recv.pcb);
+        if ((e.event == LWIP_TCP_DNS) && (e.dns.addr != nullptr)) {
+            free(e.dns.addr);
+        }
     } else if(e.event == LWIP_TCP_CLEAR){
         _remove_events_with_arg(e.arg);
     } else if(e.event == LWIP_TCP_RECV){
@@ -163,7 +166,8 @@ static void _handle_async_event(lwip_event_packet_t& e){
         AsyncServer::_s_accepted(e.arg, e.accept.client);
     } else if(e.event == LWIP_TCP_DNS){
         //ets_printf("D: 0x%08x %s = %s\n", e.arg, e.dns.name, ipaddr_ntoa(&e.dns.addr));
-        AsyncClient::_s_dns_found(e.dns.name, &e.dns.addr, e.arg);
+        AsyncClient::_s_dns_found(e.dns.name, e.dns.addr, e.arg);
+        if (e.dns.addr) free(e.dns.addr);
     }
 }
 
@@ -276,13 +280,15 @@ static void _tcp_error(void * arg, int8_t err) {
 static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * arg) {
     //ets_printf("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
     lwip_event_packet_t e { .event = LWIP_TCP_DNS, .arg = arg };
-    e.dns.name = name;
+    e.dns.name = name;    
     if (ipaddr) {
-        memcpy(&e.dns.addr, ipaddr, sizeof(struct ip_addr));
+        e.dns.addr = new ip_addr(*ipaddr);
     } else {
-        memset(&e.dns.addr, 0, sizeof(e.dns.addr));
+        e.dns.addr = nullptr;
     }
-    _send_async_event(e);
+    if (!_send_async_event(e) && e.dns.addr) {
+        free(e.dns.addr);
+    }
 }
 
 
