@@ -35,47 +35,53 @@ extern "C"{
  * TCP/IP Event Task
  * */
 
-typedef enum {
+namespace {
+enum lwip_event_t {
     LWIP_TCP_SENT, LWIP_TCP_RECV, LWIP_TCP_FIN, LWIP_TCP_ERROR, LWIP_TCP_POLL, LWIP_TCP_CLEAR, LWIP_TCP_ACCEPT, LWIP_TCP_CONNECTED, LWIP_TCP_DNS
-} lwip_event_t;
+};
 
-typedef struct {
-        lwip_event_t event;
-        void *arg;
-        union {
-                struct {
-                        void * pcb;
-                        int8_t err;
-                } connected;
-                struct {
-                        int8_t err;
-                } error;
-                struct {
-                        tcp_pcb * pcb;
-                        uint16_t len;
-                } sent;
-                struct {
-                        tcp_pcb * pcb;
-                        pbuf * pb;
-                        int8_t err;
-                } recv;
-                struct {
-                        tcp_pcb * pcb;
-                        int8_t err;
-                } fin;
-                struct {
-                        tcp_pcb * pcb;
-                } poll;
-                struct {
-                        AsyncClient * client;
-                } accept;
-                struct {
-                        const char * name;
-                        ip_addr_t addr;
-                } dns;
-        };
-} lwip_event_packet_t;
+struct lwip_event_packet_t {
+    lwip_event_t event;
+    void *arg;
+    union {
+        struct {
+                void * pcb;
+                int8_t err;
+        } connected;
+        struct {
+                int8_t err;
+        } error;
+        struct {
+                tcp_pcb * pcb;
+                uint16_t len;
+        } sent;
+        struct {
+                tcp_pcb * pcb;
+                pbuf * pb;
+                int8_t err;
+        } recv;
+        struct {
+                tcp_pcb * pcb;
+                int8_t err;
+        } fin;
+        struct {
+                tcp_pcb * pcb;
+        } poll;
+        struct {
+                AsyncClient * client;
+        } accept;
+        struct {
+                const char * name;
+                ip_addr_t addr;
+        } dns;
+    };
 
+    bool operator==(const lwip_event_packet_t& r) { return memcmp(this, &r, sizeof(*this)) == 0; }
+};
+};
+
+static lwip_event_packet_t _async_queue_data[CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE];
+static StaticQueue_t _async_queue_queue;
 static xQueueHandle _async_queue;
 static TaskHandle_t _async_service_task_handle = NULL;
 
@@ -95,7 +101,7 @@ static uint32_t _closed_index = []() {
 
 static inline bool _init_async_event_queue(){
     if(!_async_queue){
-        _async_queue = xQueueCreate(CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE, sizeof(lwip_event_packet_t *));
+        _async_queue = xQueueCreateStatic(CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE, sizeof(lwip_event_packet_t), (uint8_t*) _async_queue_data, &_async_queue_queue);
         if(!_async_queue){
             return false;
         }
@@ -103,96 +109,68 @@ static inline bool _init_async_event_queue(){
     return true;
 }
 
-static inline bool _send_async_event(lwip_event_packet_t ** e){
-    return _async_queue && xQueueSend(_async_queue, e, portMAX_DELAY) == pdPASS;
+static inline bool _send_async_event(const lwip_event_packet_t& e){
+    return _async_queue && xQueueSend(_async_queue, &e, portMAX_DELAY) == pdPASS;
 }
 
-static inline bool _prepend_async_event(lwip_event_packet_t ** e){
-    return _async_queue && xQueueSendToFront(_async_queue, e, portMAX_DELAY) == pdPASS;
+static inline bool _prepend_async_event(const lwip_event_packet_t& e){
+    return _async_queue && xQueueSendToFront(_async_queue, &e, portMAX_DELAY) == pdPASS;
 }
 
-static inline bool _get_async_event(lwip_event_packet_t ** e){
-    return _async_queue && xQueueReceive(_async_queue, e, portMAX_DELAY) == pdPASS;
+static inline bool _get_async_event(lwip_event_packet_t& e){
+    return _async_queue && xQueueReceive(_async_queue, &e, portMAX_DELAY) == pdPASS;
 }
 
+// this function must be run by the consumer to be safe
 static bool _remove_events_with_arg(void * arg){
-    lwip_event_packet_t * first_packet = NULL;
-    lwip_event_packet_t * packet = NULL;
-
-    if(!_async_queue){
-        return false;
-    }
-    //figure out which is the first packet so we can keep the order
-    while(!first_packet){
-        if(xQueueReceive(_async_queue, &first_packet, 0) != pdPASS){
-            return false;
-        }
-        //discard packet if matching
-        if((int)first_packet->arg == (int)arg){
-            free(first_packet);
-            first_packet = NULL;
-        //return first packet to the back of the queue
-        } else if(xQueueSend(_async_queue, &first_packet, portMAX_DELAY) != pdPASS){
-            // couldn't requeue packet, free it before returning
-            free(first_packet);
-            return false;
-        }
-    }
-
-    while(xQueuePeek(_async_queue, &packet, 0) == pdPASS && packet != first_packet){
-        if(xQueueReceive(_async_queue, &packet, 0) != pdPASS){
-            return false;
-        }
-        if((int)packet->arg == (int)arg){
-            free(packet);
-            packet = NULL;
-        } else if(xQueueSend(_async_queue, &packet, portMAX_DELAY) != pdPASS){
-            // couldn't requeue packet, free it before returning
-            free(packet);
-            return false;
+    // ets_printf("+rea: 0x%08x\n", arg);
+    for(auto i = 0U; i < CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE; ++i) {
+        // Null out the elements without changing the queue        
+        if (_async_queue_data[i].arg == arg) {
+            _async_queue_data[i].arg = nullptr;
         }
     }
     return true;
 }
 
-static void _handle_async_event(lwip_event_packet_t * e){
-    if(e->arg == NULL){
+static void _handle_async_event(lwip_event_packet_t& e){
+    // TODO - should this be a switch-case?
+    if(e.arg == NULL){
         // do nothing when arg is NULL
-        //ets_printf("event arg == NULL: 0x%08x\n", e->recv.pcb);
-    } else if(e->event == LWIP_TCP_CLEAR){
-        _remove_events_with_arg(e->arg);
-    } else if(e->event == LWIP_TCP_RECV){
-        //ets_printf("-R: 0x%08x\n", e->recv.pcb);
-        AsyncClient::_s_recv(e->arg, e->recv.pcb, e->recv.pb, e->recv.err);
-    } else if(e->event == LWIP_TCP_FIN){
-        //ets_printf("-F: 0x%08x\n", e->fin.pcb);
-        AsyncClient::_s_fin(e->arg, e->fin.pcb, e->fin.err);
-    } else if(e->event == LWIP_TCP_SENT){
-        //ets_printf("-S: 0x%08x\n", e->sent.pcb);
-        AsyncClient::_s_sent(e->arg, e->sent.pcb, e->sent.len);
-    } else if(e->event == LWIP_TCP_POLL){
-        //ets_printf("-P: 0x%08x\n", e->poll.pcb);
-        AsyncClient::_s_poll(e->arg, e->poll.pcb);
-    } else if(e->event == LWIP_TCP_ERROR){
-        //ets_printf("-E: 0x%08x %d\n", e->arg, e->error.err);
-        AsyncClient::_s_error(e->arg, e->error.err);
-    } else if(e->event == LWIP_TCP_CONNECTED){
-        //ets_printf("C: 0x%08x 0x%08x %d\n", e->arg, e->connected.pcb, e->connected.err);
-        AsyncClient::_s_connected(e->arg, e->connected.pcb, e->connected.err);
-    } else if(e->event == LWIP_TCP_ACCEPT){
-        //ets_printf("A: 0x%08x 0x%08x\n", e->arg, e->accept.client);
-        AsyncServer::_s_accepted(e->arg, e->accept.client);
-    } else if(e->event == LWIP_TCP_DNS){
-        //ets_printf("D: 0x%08x %s = %s\n", e->arg, e->dns.name, ipaddr_ntoa(&e->dns.addr));
-        AsyncClient::_s_dns_found(e->dns.name, &e->dns.addr, e->arg);
+        //ets_printf("event arg == NULL: 0x%08x\n", e.recv.pcb);
+    } else if(e.event == LWIP_TCP_CLEAR){
+        _remove_events_with_arg(e.arg);
+    } else if(e.event == LWIP_TCP_RECV){
+        //ets_printf("-R: 0x%08x\n", e.recv.pcb);
+        AsyncClient::_s_recv(e.arg, e.recv.pcb, e.recv.pb, e.recv.err);
+    } else if(e.event == LWIP_TCP_FIN){
+        //ets_printf("-F: 0x%08x\n", e.fin.pcb);
+        AsyncClient::_s_fin(e.arg, e.fin.pcb, e.fin.err);
+    } else if(e.event == LWIP_TCP_SENT){
+        //ets_printf("-S: 0x%08x\n", e.sent.pcb);
+        AsyncClient::_s_sent(e.arg, e.sent.pcb, e.sent.len);
+    } else if(e.event == LWIP_TCP_POLL){
+        //ets_printf("-P: 0x%08x\n", e.poll.pcb);
+        AsyncClient::_s_poll(e.arg, e.poll.pcb);
+    } else if(e.event == LWIP_TCP_ERROR){
+        //ets_printf("-E: 0x%08x %d\n", e.arg, e.error.err);
+        AsyncClient::_s_error(e.arg, e.error.err);
+    } else if(e.event == LWIP_TCP_CONNECTED){
+        //ets_printf("C: 0x%08x 0x%08x %d\n", e.arg, e.connected.pcb, e.connected.err);
+        AsyncClient::_s_connected(e.arg, e.connected.pcb, e.connected.err);
+    } else if(e.event == LWIP_TCP_ACCEPT){
+        //ets_printf("A: 0x%08x 0x%08x\n", e.arg, e.accept.client);
+        AsyncServer::_s_accepted(e.arg, e.accept.client);
+    } else if(e.event == LWIP_TCP_DNS){
+        //ets_printf("D: 0x%08x %s = %s\n", e.arg, e.dns.name, ipaddr_ntoa(&e.dns.addr));
+        AsyncClient::_s_dns_found(e.dns.name, &e.dns.addr, e.arg);
     }
-    free((void*)(e));
 }
 
 static void _async_service_task(void *pvParameters){
-    lwip_event_packet_t * packet = NULL;
+    lwip_event_packet_t packet;
     for (;;) {
-        if(_get_async_event(&packet)){
+        if(_get_async_event(packet)){
 #if CONFIG_ASYNC_TCP_USE_WDT
             if(esp_task_wdt_add(NULL) != ESP_OK){
                 log_e("Failed to add async task to WDT");
@@ -237,128 +215,82 @@ static bool _start_async_task(){
  * */
 
 static int8_t _tcp_clear_events(void * arg) {
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->event = LWIP_TCP_CLEAR;
-        e->arg = arg;
-        if (!_prepend_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    lwip_event_packet_t e { .event=LWIP_TCP_CLEAR, .arg=arg };
+    _prepend_async_event(e);
     return ERR_OK;
 }
 
 static int8_t _tcp_connected(void * arg, tcp_pcb * pcb, int8_t err) {
     //ets_printf("+C: 0x%08x\n", pcb);
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->event = LWIP_TCP_CONNECTED;
-        e->arg = arg;
-        e->connected.pcb = pcb;
-        e->connected.err = err;
-        if (!_prepend_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    lwip_event_packet_t e { .event = LWIP_TCP_CONNECTED, .arg = arg };
+    e.connected.pcb = pcb;
+    e.connected.err = err;
+    _prepend_async_event(e);
     return ERR_OK;
 }
 
 static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb) {
     //ets_printf("+P: 0x%08x\n", pcb);
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->event = LWIP_TCP_POLL;
-        e->arg = arg;
-        e->poll.pcb = pcb;
-        if (!_send_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    lwip_event_packet_t e { .event = LWIP_TCP_POLL, .arg = arg };
+    e.poll.pcb = pcb;
+    _send_async_event(e);
     return ERR_OK;
 }
 
 static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, int8_t err) {
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->arg = arg;
-        if(pb){
-            //ets_printf("+R: 0x%08x\n", pcb);
-            e->event = LWIP_TCP_RECV;
-            e->recv.pcb = pcb;
-            e->recv.pb = pb;
-            e->recv.err = err;
-        } else {
-            //ets_printf("+F: 0x%08x\n", pcb);
-            e->event = LWIP_TCP_FIN;
-            e->fin.pcb = pcb;
-            e->fin.err = err;
-            //close the PCB in LwIP thread
-            AsyncClient::_s_lwip_fin(e->arg, e->fin.pcb, e->fin.err);
-        }
-        if (!_send_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    if (pb) {
+        //ets_printf("+R: 0x%08x\n", pcb);
+        lwip_event_packet_t e { .event = LWIP_TCP_RECV, .arg = arg };
+        e.recv.pcb = pcb;
+        e.recv.pb = pb;
+        e.recv.err = err;
+        _send_async_event(e);
+    } else {
+        //ets_printf("+F: 0x%08x\n", pcb);
+        lwip_event_packet_t e { .event = LWIP_TCP_FIN, .arg = arg };
+        e.fin.pcb = pcb;
+        e.fin.err = err;
+        //close the PCB in LwIP thread
+        AsyncClient::_s_lwip_fin(arg, pcb, err);
+        _send_async_event(e);
+    };
     return ERR_OK;
 }
 
 static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len) {
     //ets_printf("+S: 0x%08x\n", pcb);
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->event = LWIP_TCP_SENT;
-        e->arg = arg;
-        e->sent.pcb = pcb;
-        e->sent.len = len;
-        if (!_send_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    lwip_event_packet_t e { .event = LWIP_TCP_SENT, .arg = arg };
+    e.sent.pcb = pcb;
+    e.sent.len = len;
+    _send_async_event(e);
     return ERR_OK;
 }
 
 static void _tcp_error(void * arg, int8_t err) {
     //ets_printf("+E: 0x%08x\n", arg);
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->event = LWIP_TCP_ERROR;
-        e->arg = arg;
-        e->error.err = err;
-        if (!_send_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    lwip_event_packet_t e { .event = LWIP_TCP_ERROR, .arg = arg };
+    e.error.err = err;
+    _send_async_event(e);
 }
 
 static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * arg) {
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
     //ets_printf("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
-    if (NULL != e) {
-        e->event = LWIP_TCP_DNS;
-        e->arg = arg;
-        e->dns.name = name;
-        if (ipaddr) {
-            memcpy(&e->dns.addr, ipaddr, sizeof(struct ip_addr));
-        } else {
-            memset(&e->dns.addr, 0, sizeof(e->dns.addr));
-        }
-        if (!_send_async_event(&e)) {
-            free((void*)(e));
-        }
+    lwip_event_packet_t e { .event = LWIP_TCP_DNS, .arg = arg };
+    e.dns.name = name;
+    if (ipaddr) {
+        memcpy(&e.dns.addr, ipaddr, sizeof(struct ip_addr));
+    } else {
+        memset(&e.dns.addr, 0, sizeof(e.dns.addr));
     }
+    _send_async_event(e);
 }
+
 
 //Used to switch out from LwIP thread
 static int8_t _tcp_accept(void * arg, AsyncClient * client) {
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-    if (NULL != e) {
-        e->event = LWIP_TCP_ACCEPT;
-        e->arg = arg;
-        e->accept.client = client;
-        if (!_prepend_async_event(&e)) {
-            free((void*)(e));
-        }
-    }
+    lwip_event_packet_t e { .event = LWIP_TCP_ACCEPT, .arg = arg };
+    e.accept.client = client;
+    _send_async_event(e);
     return ERR_OK;
 }
 
