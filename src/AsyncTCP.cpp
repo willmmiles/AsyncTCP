@@ -139,6 +139,7 @@ static void _handle_async_event(lwip_event_packet_t& e){
         // do nothing when arg is NULL
         //ets_printf("event arg == NULL: 0x%08x\n", e.recv.pcb);
         if ((e.event == LWIP_TCP_DNS) && (e.dns.addr != nullptr)) {
+            //ets_printf("DNS free on null event %08x\n", (intptr_t) e.dns.addr);
             free(e.dns.addr);
         }
     } else if(e.event == LWIP_TCP_CLEAR){
@@ -165,7 +166,7 @@ static void _handle_async_event(lwip_event_packet_t& e){
         //ets_printf("A: 0x%08x 0x%08x\n", e.arg, e.accept.client);
         AsyncServer::_s_accepted(e.arg, e.accept.client);
     } else if(e.event == LWIP_TCP_DNS){
-        //ets_printf("D: 0x%08x %s = %s\n", e.arg, e.dns.name, ipaddr_ntoa(&e.dns.addr));
+        //ets_printf("D: 0x%08x %s = %s\n", e.arg, e.dns.name, ipaddr_ntoa(e.dns.addr));
         AsyncClient::_s_dns_found(e.dns.name, e.dns.addr, e.arg);
         if (e.dns.addr) free(e.dns.addr);
     }
@@ -283,10 +284,12 @@ static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * ar
     e.dns.name = name;    
     if (ipaddr) {
         e.dns.addr = new ip_addr(*ipaddr);
+        //ets_printf("+DNS: ipaddr allo'd at 0x%08x\n", (intptr_t) e.dns.addr);
     } else {
         e.dns.addr = nullptr;
     }
     if (!_send_async_event(e) && e.dns.addr) {
+        //ets_printf("+DNS: queue fail, free 0x%08x\n", (intptr_t) e.dns.addr);
         free(e.dns.addr);
     }
 }
