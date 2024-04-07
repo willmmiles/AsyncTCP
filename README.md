@@ -7,7 +7,7 @@ The following symbols can be defined to change the configuration
 
 | Name | Description | Default |
 | ---- | ----------- | ------- |
-| CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE | The size of the queue string TCP events to process | CONFIG_LWIP_MAX_ACTIVE_TCP * 2 == 32 |
+| CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE | The size of the queue string TCP events to process | CONFIG_LWIP_MAX_ACTIVE_TCP * 4 == 64 |
 | CONFIG_ASYNC_TCP_RUNNING_CORE | The CPU core to run the async task on | -1 (any cpu) |
 | CONFIG_ASYNC_TCP_USE_WDT | If the watchdog timer should be enabled while processing TCP messages. Set to 0 to disable | 1 (enabled) | 
 | CONFIG_ASYNC_TCP_TASK_STACK_SIZE | The number of 32-bit words (not bytes!) to allocate for use as the task's stack. | 8192 | 

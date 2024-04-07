@@ -2,6 +2,12 @@
 
 Newest at top
 
+## 2024-04-07
+
+**Commit** [375dee3366c60f732e9a9ce9383ad0fb5ab44d78](https://github.com/willmmiles/AsyncTCP/commit/375dee3366c60f732e9a9ce9383ad0fb5ab44d78)
+
+* Increase default event queue size to reduce likelihood of deadlocking
+
 ## 2021-09-02 - Check for error on connect and return false if the connection failed
 
 **Commit**: [c4d43765217a67f8394bf946336ce55a13aef31a](https://github.com/pbolduc/AsyncTCP/commit/c4d43765217a67f8394bf946336ce55a13aef31a)
