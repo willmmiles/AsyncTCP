@@ -590,8 +590,6 @@ AsyncClient::AsyncClient(tcp_pcb* pcb)
 , _rx_last_ack(0)
 , _ack_timeout(ASYNC_MAX_ACK_TIME)
 , _connect_port(0)
-, prev(NULL)
-, next(NULL)
 {
     _pcb = pcb;
     _closed_slot = -1;
@@ -613,41 +611,8 @@ AsyncClient::~AsyncClient(){
  * Operators
  * */
 
-AsyncClient& AsyncClient::operator=(const AsyncClient& other){
-    if (_pcb) {
-        _close();
-    }
-
-    _pcb = other._pcb;
-    _closed_slot = other._closed_slot;
-    if (_pcb) {
-        _rx_last_packet = millis();
-        tcp_arg(_pcb, this);
-        tcp_recv(_pcb, &_tcp_recv);
-        tcp_sent(_pcb, &_tcp_sent);
-        tcp_err(_pcb, &_tcp_error);
-        tcp_poll(_pcb, &_tcp_poll, 1);
-    }
-    return *this;
-}
-
 bool AsyncClient::operator==(const AsyncClient &other) {
     return _pcb == other._pcb;
-}
-
-AsyncClient & AsyncClient::operator+=(const AsyncClient &other) {
-    if(next == NULL){
-        next = (AsyncClient*)(&other);
-        next->prev = this;
-    } else {
-        AsyncClient *c = next;
-        while(c->next != NULL) {
-            c = c->next;
-        }
-        c->next =(AsyncClient*)(&other);
-        c->next->prev = c;
-    }
-    return *this;
 }
 
 /*

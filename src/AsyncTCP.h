@@ -79,11 +79,11 @@ class AsyncClient {
     AsyncClient(tcp_pcb* pcb = 0);
     ~AsyncClient();
 
-    AsyncClient & operator=(const AsyncClient &other);
-    AsyncClient & operator+=(const AsyncClient &other);
+    // Not copyable
+    AsyncClient(const AsyncClient&) = delete;
+    AsyncClient& operator=(const AsyncClient &other) = delete;
 
     bool operator==(const AsyncClient &other);
-
     bool operator!=(const AsyncClient &other) {
       return !(*this == other);
     }
@@ -208,12 +208,7 @@ class AsyncClient {
     int8_t _poll(tcp_pcb* pcb);
     int8_t _sent(tcp_pcb* pcb, uint16_t len);
     int8_t _fin(tcp_pcb* pcb, int8_t err);
-    int8_t _lwip_fin(tcp_pcb* pcb, int8_t err);
     void _dns_found(struct ip_addr *ipaddr);
-
-  public:
-    AsyncClient* prev;
-    AsyncClient* next;
 };
 
 class AsyncServer {
