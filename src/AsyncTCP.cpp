@@ -1348,16 +1348,18 @@ void AsyncServer::end(){
 
 //runs on LwIP thread
 int8_t AsyncServer::_accept(tcp_pcb* pcb, int8_t err){
-    //ets_printf("+A: 0x%08x\n", pcb);
-    if(_connect_cb){
-        AsyncClient *c = new AsyncClient(pcb);
-        if(c){
-            c->setNoDelay(_noDelay);
-            return _tcp_accept(this, c);
+    //ets_printf("+A: 0x%08x %d\n", pcb, err);    
+    if (pcb) {
+        if(_connect_cb){
+            AsyncClient *c = new AsyncClient(pcb);
+            if(c){
+                c->setNoDelay(_noDelay);
+                return _tcp_accept(this, c);
+            }
+        }        
+        if(tcp_close(pcb) != ERR_OK){
+            tcp_abort(pcb);
         }
-    }
-    if(tcp_close(pcb) != ERR_OK){
-        tcp_abort(pcb);
     }
     log_e("FAIL");
     return ERR_OK;
