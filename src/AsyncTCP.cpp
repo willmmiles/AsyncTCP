@@ -171,6 +171,15 @@ static inline bool _get_async_event(lwip_event_packet_t ** e){
     return _async_queue && xQueueReceive(_async_queue, e, portMAX_DELAY) == pdPASS;
 }
 
+static void _remove_event(lwip_event_packet_t* evpkt) {
+    // used by below to free packets
+    if ((evpkt->event == LWIP_TCP_RECV) && (evpkt->recv.pcb != nullptr)) {
+        // We must free the packet buffer
+        pbuf_free(evpkt->recv.pb);
+    }
+    free(evpkt);
+}
+
 static bool _remove_events_with_arg(void * arg){
     lwip_event_packet_t * first_packet = NULL;
     lwip_event_packet_t * packet = NULL;
@@ -185,12 +194,12 @@ static bool _remove_events_with_arg(void * arg){
         }
         //discard packet if matching
         if((int)first_packet->arg == (int)arg){
-            free(first_packet);
+            _remove_event(first_packet);
             first_packet = NULL;
         //return first packet to the back of the queue
         } else if(xQueueSend(_async_queue, &first_packet, portMAX_DELAY) != pdPASS){
             // couldn't requeue packet, free it before returning
-            free(first_packet);
+            _remove_event(first_packet);
             return false;
         }
     }
@@ -200,11 +209,11 @@ static bool _remove_events_with_arg(void * arg){
             return false;
         }
         if((int)packet->arg == (int)arg){
-            free(packet);
+            _remove_event(packet);
             packet = NULL;
         } else if(xQueueSend(_async_queue, &packet, portMAX_DELAY) != pdPASS){
             // couldn't requeue packet, free it before returning
-            free(packet);
+            _remove_event(packet);
             return false;
         }
     }
