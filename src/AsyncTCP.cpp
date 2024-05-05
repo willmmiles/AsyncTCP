@@ -37,6 +37,8 @@ extern "C"{
 #define DEBUG_PRINTF(...)
 #endif
 
+static_assert(__gnu_cxx::__default_lock_policy != __gnu_cxx::_S_single, "shared_ptr is not thread safe - upgrade your toolchain");
+
 /*
  * TCP/IP Event Task
  * */
@@ -91,53 +93,8 @@ static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
 // Global variables
 static xQueueHandle _async_queue;
 static TaskHandle_t _async_service_task_handle = NULL;
-SemaphoreHandle_t _active_pcbs_lock;
-const int _max_active_pcbs = (2*CONFIG_LWIP_MAX_ACTIVE_TCP);
-static tcp_pcb* _active_pcbs[_max_active_pcbs];
-static uint32_t _next_active_pcb_slot = []() {
-    memset(_active_pcbs, 0, sizeof(_active_pcbs));
-    _active_pcbs_lock = xSemaphoreCreateBinary();
-    xSemaphoreGive(_active_pcbs_lock);
-    return 0;
-}();
 
-// Register a PCB in our list of active PCBs.
-// Returns the slot number of the newly registered entry.
-static int _register_pcb(tcp_pcb* pcb, void* arg){
-    xSemaphoreTake(_active_pcbs_lock, portMAX_DELAY);
-    // Find an empty slot
-    size_t slot = _next_active_pcb_slot;
-    do {
-        if (_active_pcbs[slot] == nullptr) {
-            _active_pcbs[slot] = pcb;
-            _next_active_pcb_slot = (slot+1) % _max_active_pcbs;
-            break;
-        }
-        slot = (slot+1) % _max_active_pcbs;
-    } while (slot != _next_active_pcb_slot);    
-    xSemaphoreGive(_active_pcbs_lock);
-    if (_active_pcbs[slot] != pcb) return -1; // couldn't register, buffer is full
-    // do setup
-    tcp_arg(pcb, arg);
-    tcp_recv(pcb, &_tcp_recv);
-    tcp_sent(pcb, &_tcp_sent);
-    tcp_err(pcb, &_tcp_error);
-    tcp_poll(pcb, &_tcp_poll, 1);
-    
-    return slot;
-}
-
-// Release a PCB from the list of active PCBs.
-static void _release_pcb(int slot, tcp_pcb* pcb) {
-    assert(pcb);
-    assert(slot >= 0); 
-    assert(slot < _max_active_pcbs);
-    xSemaphoreTake(_active_pcbs_lock, portMAX_DELAY);
-    if (_active_pcbs[slot] == pcb) {
-        _active_pcbs[slot] = nullptr;
-    }
-    xSemaphoreGive(_active_pcbs_lock);
-}
+static inline bool is_valid(const std::shared_ptr<tcp_pcb*>& ref) { return ref && *ref; }
 
 static void _teardown_pcb(tcp_pcb* pcb) {
     assert(pcb);
@@ -147,6 +104,28 @@ static void _teardown_pcb(tcp_pcb* pcb) {
     tcp_recv(pcb, NULL);
     tcp_err(pcb, NULL);
     tcp_poll(pcb, NULL, 0);
+}
+
+static void _release_pcb(tcp_pcb** pcb_ptr) {
+    if (!pcb_ptr) return;
+    if (*pcb_ptr) {
+        // do the close thing
+        // TODO
+    }
+    delete pcb_ptr;
+}
+
+// Register a PCB in our list of active PCBs.
+// Returns the slot number of the newly registered entry.
+static std::shared_ptr<tcp_pcb*> _register_pcb(tcp_pcb* pcb, void* arg){
+    // do setup
+    tcp_arg(pcb, arg);
+    tcp_recv(pcb, &_tcp_recv);
+    tcp_sent(pcb, &_tcp_sent);
+    tcp_err(pcb, &_tcp_error);
+    tcp_poll(pcb, &_tcp_poll, 1);
+    
+    return std::shared_ptr<tcp_pcb*>(new tcp_pcb*(pcb), _release_pcb);
 }
 
 static inline bool _init_async_event_queue(){
@@ -323,6 +302,7 @@ static int8_t _tcp_connected(void * arg, tcp_pcb * pcb, int8_t err) {
         e->connected.pcb = pcb;
         e->connected.err = err;
         if (!_prepend_async_event(&e)) {
+            // WM: pcb is now leaked .. !
             free((void*)(e));
         }
     }
@@ -388,7 +368,7 @@ static void _tcp_error(void * arg, int8_t err) {
         e->event = LWIP_TCP_ERROR;
         e->arg = arg;
         e->error.err = err;
-        if (!_send_async_event(&e)) {
+        if (!_prepend_async_event(&e)) {    // pcb is now invalid
             free((void*)(e));
         }
     }
@@ -434,8 +414,7 @@ static int8_t _tcp_accept(void * arg, AsyncClient * client) {
 
 typedef struct {
     struct tcpip_api_call_data call;
-    tcp_pcb * pcb;
-    int8_t pcb_slot;
+    std::shared_ptr<tcp_pcb*> pcb;
     int8_t err;
     union {
             struct {
@@ -462,26 +441,24 @@ typedef struct {
 // yet.  Before performing any operation on a pcb, check to make sure we
 // are still tracking it.
 static inline bool pcb_is_active(tcp_api_call_t& p) {
-    assert(p.pcb);
-    return (p.pcb_slot >= 0) && (_active_pcbs[p.pcb_slot] == p.pcb);
+    return is_valid(p.pcb);
 }
 
 static err_t _tcp_output_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
     msg->err = ERR_CONN;
     if(pcb_is_active(*msg)) {
-        msg->err = tcp_output(msg->pcb);
+        msg->err = tcp_output(*msg->pcb);
     }
     return msg->err;
 }
 
-static esp_err_t _tcp_output(tcp_pcb * pcb, int8_t pcb_slot) {
-    if(!pcb){
+static esp_err_t _tcp_output(const std::shared_ptr<tcp_pcb*>& pcb_ref) {
+    if(!is_valid(pcb_ref)){
         return ERR_CONN;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = pcb_slot;
+    msg.pcb = pcb_ref;
     tcpip_api_call(_tcp_output_api, (struct tcpip_api_call_data*)&msg);
     return msg.err;
 }
@@ -490,18 +467,17 @@ static err_t _tcp_write_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
     msg->err = ERR_CONN;
     if(pcb_is_active(*msg)) {
-        msg->err = tcp_write(msg->pcb, msg->write.data, msg->write.size, msg->write.apiflags);
+        msg->err = tcp_write(*msg->pcb, msg->write.data, msg->write.size, msg->write.apiflags);
     }
     return msg->err;
 }
 
-static esp_err_t _tcp_write(tcp_pcb * pcb, int8_t pcb_slot, const char* data, size_t size, uint8_t apiflags) {
-    if(!pcb){
+static esp_err_t _tcp_write(const std::shared_ptr<tcp_pcb*>& pcb_ref, const char* data, size_t size, uint8_t apiflags) {
+    if(!is_valid(pcb_ref)){
         return ERR_CONN;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = pcb_slot;
+    msg.pcb = pcb_ref;
     msg.write.data = data;
     msg.write.size = size;
     msg.write.apiflags = apiflags;
@@ -514,18 +490,17 @@ static err_t _tcp_recved_api(struct tcpip_api_call_data *api_call_msg){
     msg->err = ERR_CONN;
     if(pcb_is_active(*msg)) {
         msg->err = 0;
-        tcp_recved(msg->pcb, msg->received);
+        tcp_recved(*msg->pcb, msg->received);
     }
     return msg->err;
 }
 
-static esp_err_t _tcp_recved(tcp_pcb * pcb, int8_t pcb_slot, size_t len) {
-    if(!pcb){
+static esp_err_t _tcp_recved(const std::shared_ptr<tcp_pcb*>& pcb_ref, size_t len) {
+    if(!is_valid(pcb_ref)){
         return ERR_CONN;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = pcb_slot;
+    msg.pcb = pcb_ref;
     msg.received = len;
     tcpip_api_call(_tcp_recved_api, (struct tcpip_api_call_data*)&msg);
     return msg.err;
@@ -536,23 +511,22 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
     msg->err = ERR_CONN;
     if(pcb_is_active(*msg)) {        
-        _teardown_pcb(msg->pcb);
-        msg->err = tcp_close(msg->pcb);
+        _teardown_pcb(*msg->pcb);
+        msg->err = tcp_close(*msg->pcb);
         if (msg->err == ERR_OK) {
             // pcb will be freed by stack shortly
-            _release_pcb(msg->pcb_slot, msg->pcb);
+            *msg->pcb = nullptr;
         }
     }
     return msg->err;
 }
 
-static esp_err_t _tcp_close(tcp_pcb * pcb, int8_t pcb_slot) {
-    if(!pcb){
+static esp_err_t _tcp_close(const std::shared_ptr<tcp_pcb*>& pcb_ref) {
+    if(!is_valid(pcb_ref)){
         return ERR_CONN;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = pcb_slot;
+    msg.pcb = pcb_ref;
     tcpip_api_call(_tcp_close_api, (struct tcpip_api_call_data*)&msg);
     return msg.err;
 }
@@ -561,37 +535,39 @@ static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
     msg->err = ERR_CONN;
     if(pcb_is_active(*msg)) {
-        _teardown_pcb(msg->pcb);
-        tcp_abort(msg->pcb);
-        _release_pcb(msg->pcb_slot, msg->pcb);
+        _teardown_pcb(*msg->pcb);
+        tcp_abort(*msg->pcb);
+        *msg->pcb = nullptr; // pcb will be freed by stack shortly
     }
     return msg->err;
 }
 
-static esp_err_t _tcp_abort(tcp_pcb * pcb, int8_t pcb_slot) {
-    if(!pcb){
+static esp_err_t _tcp_abort(const std::shared_ptr<tcp_pcb*>& pcb_ref) {
+    if(!is_valid(pcb_ref)){
         return ERR_CONN;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = pcb_slot;
+    msg.pcb = pcb_ref;
     tcpip_api_call(_tcp_abort_api, (struct tcpip_api_call_data*)&msg);
     return msg.err;
 }
 
 static err_t _tcp_connect_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
-    msg->err = tcp_connect(msg->pcb, msg->connect.addr, msg->connect.port, msg->connect.cb);
+    if (is_valid(msg->pcb)) {
+        msg->err = tcp_connect(*msg->pcb, msg->connect.addr, msg->connect.port, msg->connect.cb);
+    } else {
+        msg->err = ESP_FAIL;
+    }
     return msg->err;
 }
 
-static esp_err_t _tcp_connect(tcp_pcb * pcb, int8_t pcb_slot, ip_addr_t * addr, uint16_t port, tcp_connected_fn cb) {
-    if(!pcb){
+static esp_err_t _tcp_connect(const std::shared_ptr<tcp_pcb*>& pcb_ref, ip_addr_t * addr, uint16_t port, tcp_connected_fn cb) {
+    if(!is_valid(pcb_ref)){
         return ESP_FAIL;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = pcb_slot;
+    msg.pcb = pcb_ref;
     msg.connect.addr = addr;
     msg.connect.port = port;
     msg.connect.cb = cb;
@@ -601,17 +577,19 @@ static esp_err_t _tcp_connect(tcp_pcb * pcb, int8_t pcb_slot, ip_addr_t * addr, 
 
 static err_t _tcp_bind_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
-    msg->err = tcp_bind(msg->pcb, msg->bind.addr, msg->bind.port);
+    msg->err = ESP_FAIL;
+    if(pcb_is_active(*msg)) {
+        msg->err = tcp_bind(*msg->pcb, msg->bind.addr, msg->bind.port);
+    }
     return msg->err;
 }
 
-static esp_err_t _tcp_bind(tcp_pcb * pcb, ip_addr_t * addr, uint16_t port) {
+static esp_err_t _tcp_bind(tcp_pcb* pcb, ip_addr_t * addr, uint16_t port) {
     if(!pcb){
         return ESP_FAIL;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = -1;
+    msg.pcb = std::make_shared<tcp_pcb*>(pcb);
     msg.bind.addr = addr;
     msg.bind.port = port;
     tcpip_api_call(_tcp_bind_api, (struct tcpip_api_call_data*)&msg);
@@ -621,20 +599,19 @@ static esp_err_t _tcp_bind(tcp_pcb * pcb, ip_addr_t * addr, uint16_t port) {
 static err_t _tcp_listen_api(struct tcpip_api_call_data *api_call_msg){
     tcp_api_call_t * msg = (tcp_api_call_t *)api_call_msg;
     msg->err = 0;
-    msg->pcb = tcp_listen_with_backlog(msg->pcb, msg->backlog);
+    *msg->pcb = tcp_listen_with_backlog(*msg->pcb, msg->backlog);
     return msg->err;
 }
 
-static tcp_pcb * _tcp_listen_with_backlog(tcp_pcb * pcb, uint8_t backlog) {
-    if(!pcb){
+static tcp_pcb * _tcp_listen_with_backlog(tcp_pcb* pcb, uint8_t backlog) {
+    if(!pcb) {
         return NULL;
     }
     tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.pcb_slot = -1;
+    msg.pcb = std::make_shared<tcp_pcb*>(pcb);
     msg.backlog = backlog?backlog:0xFF;
     tcpip_api_call(_tcp_listen_api, (struct tcpip_api_call_data*)&msg);
-    return msg.pcb;
+    return *msg.pcb;
 }
 
 
@@ -665,19 +642,14 @@ AsyncClient::AsyncClient(tcp_pcb* pcb)
 , _ack_timeout(ASYNC_MAX_ACK_TIME)
 , _connect_port(0)
 {
-    _pcb = pcb;
-    _pcb_slot = -1;
-    if(_pcb){
-        _pcb_slot = _register_pcb(_pcb, this);
+    if(pcb){
+        _pcb_ref = _register_pcb(pcb, this);
         _rx_last_packet = millis();
     }
     DEBUG_PRINTF("+AC: 0x%08x -> 0x%08x\n", _pcb, (intptr_t)this);
 }
 
 AsyncClient::~AsyncClient(){
-    if(_pcb) {
-        _close();
-    }
     DEBUG_PRINTF("-AC: 0x%08x -> 0x%08x\n", _pcb, (intptr_t)this);
 }
 
@@ -686,7 +658,7 @@ AsyncClient::~AsyncClient(){
  * */
 
 bool AsyncClient::operator==(const AsyncClient &other) {
-    return _pcb == other._pcb;
+    return _pcb_ref == other._pcb_ref;
 }
 
 /*
@@ -738,8 +710,8 @@ void AsyncClient::onPoll(AcConnectHandler cb, void* arg){
  * */
 
 bool AsyncClient::connect(IPAddress ip, uint16_t port){
-    if (_pcb){
-        log_w("already connected, state %d", _pcb->state);
+    if (is_valid(_pcb_ref)) {
+        log_w("already connected, state %d", *_pcb_ref->state);
         return false;
     }
     if(!_start_async_task()){
@@ -756,10 +728,11 @@ bool AsyncClient::connect(IPAddress ip, uint16_t port){
         log_e("pcb == NULL");
         return false;
     }
-    _pcb_slot = _register_pcb(pcb, this);
+    _pcb_ref = _register_pcb(pcb, this);
 
     //_tcp_connect(pcb, &addr, port,(tcp_connected_fn)&_s_connected);
-    if (ESP_OK != _tcp_connect(pcb, _pcb_slot, &addr, port,(tcp_connected_fn)&_tcp_connected)){
+    if (ESP_OK != _tcp_connect(_pcb_ref, &addr, port,(tcp_connected_fn)&_tcp_connected)){
+        _pcb_ref.reset();   // release allocation
         return false;
     }
     return true;
@@ -785,30 +758,28 @@ bool AsyncClient::connect(const char* host, uint16_t port){
 }
 
 void AsyncClient::close(bool now){
-    if(_pcb){
-        _tcp_recved(_pcb, _pcb_slot, _rx_ack_len);
+    if(is_valid(_pcb_ref)){
+        _tcp_recved(_pcb_ref, _rx_ack_len);
     }
     _close();
 }
 
 int8_t AsyncClient::abort(){
-    if(_pcb) {
-        _tcp_abort(_pcb, _pcb_slot );
-        _pcb = NULL;
-        _pcb_slot = -1;
+    if(is_valid(_pcb_ref)) {
+        _tcp_abort(_pcb_ref);
     }
     return ERR_ABRT;
 }
 
 size_t AsyncClient::space(){
-    if((_pcb != NULL) && (_pcb->state == 4)){
-        return tcp_sndbuf(_pcb);
+    if(is_valid(_pcb_ref) && ((*_pcb_ref)->state == 4)){
+        return tcp_sndbuf(*_pcb_ref);
     }
     return 0;
 }
 
 size_t AsyncClient::add(const char* data, size_t size, uint8_t apiflags) {
-    if(!_pcb || size == 0 || data == NULL) {
+    if(!is_valid(_pcb_ref) || size == 0 || data == NULL) {
         return 0;
     }
     size_t room = space();
@@ -817,7 +788,7 @@ size_t AsyncClient::add(const char* data, size_t size, uint8_t apiflags) {
     }
     size_t will_send = (room < size) ? room : size;
     int8_t err = ERR_OK;
-    err = _tcp_write(_pcb, _pcb_slot, data, will_send, apiflags);
+    err = _tcp_write(_pcb_ref, data, will_send, apiflags);
     if(err != ERR_OK) {
         return 0;
     }
@@ -827,7 +798,7 @@ size_t AsyncClient::add(const char* data, size_t size, uint8_t apiflags) {
 bool AsyncClient::send(){
     auto backup = _tx_last_packet;
     _tx_last_packet = millis();
-    if (_tcp_output(_pcb, _pcb_slot) == ERR_OK) {
+    if (_tcp_output(_pcb_ref) == ERR_OK) {
         return true;
     }
     _tx_last_packet = backup;
@@ -837,8 +808,8 @@ bool AsyncClient::send(){
 size_t AsyncClient::ack(size_t len){
     if(len > _rx_ack_len)
         len = _rx_ack_len;
-    if(len){
-        _tcp_recved(_pcb, _pcb_slot, len);
+    if(len) {
+        _tcp_recved(_pcb_ref, len);
     }
     _rx_ack_len -= len;
     return len;
@@ -848,7 +819,7 @@ void AsyncClient::ackPacket(struct pbuf * pb){
   if(!pb){
     return;
   }
-  _tcp_recved(_pcb, _pcb_slot, pb->len);
+  _tcp_recved(_pcb_ref, pb->len);
   pbuf_free(pb);
 }
 
@@ -859,15 +830,14 @@ void AsyncClient::ackPacket(struct pbuf * pb){
 int8_t AsyncClient::_close(){
     DEBUG_PRINTF("close: 0x%08x\n", (uint32_t)this);
     int8_t err = ERR_OK;
-    if(_pcb) {
+    if(is_valid(_pcb_ref)) {
         //log_i("");        
-        err = _tcp_close(_pcb, _pcb_slot);
+        err = _tcp_close(_pcb_ref);
         _tcp_clear_events(this);
         if(err != ERR_OK) {
             err = abort();
         }
-        _pcb = NULL;
-        _pcb_slot = -1;
+        _pcb_ref.reset();
         if(_discard_cb) {
             _discard_cb(_discard_cb_arg, this);
         }        
@@ -893,13 +863,10 @@ UBaseType_t AsyncClient::getStackHighWaterMark(){
  * Private Callbacks
  * */
 
-int8_t AsyncClient::_connected(void* pcb, int8_t err){
-    _pcb = reinterpret_cast<tcp_pcb*>(pcb);
-    if(_pcb){
+int8_t AsyncClient::_connected(void* pcb, int8_t err){    
+    if(pcb){
+        assert(pcb == *_pcb_ref);
         _rx_last_packet = millis();
-//        tcp_recv(_pcb, &_tcp_recv);
-//        tcp_sent(_pcb, &_tcp_sent);
-//        tcp_poll(_pcb, &_tcp_poll, 1);
     }
     if(_connect_cb) {
         _connect_cb(_connect_cb_arg, this);
@@ -908,13 +875,11 @@ int8_t AsyncClient::_connected(void* pcb, int8_t err){
 }
 
 void AsyncClient::_error(int8_t err) {
-    if(_pcb){
-        // WM: is this safe to do here???
-        _teardown_pcb(_pcb);
-        _release_pcb(_pcb_slot, _pcb);
-        _pcb = NULL;
-        _pcb_slot = -1;
+    if(is_valid(_pcb_ref)){
+        // The pcb has already been deallocated by the lwip stack and is no longer valid
+        *_pcb_ref = nullptr;        
     }
+    _tcp_clear_events(this);
     if(_error_cb) {
         _error_cb(_error_cb_arg, this, err);
     }
@@ -925,6 +890,8 @@ void AsyncClient::_error(int8_t err) {
 
 //In Async Thread
 int8_t AsyncClient::_fin(tcp_pcb* pcb, int8_t err) {
+    // WM: This isn't strictly correct - the client is permitted to continue sending
+    // Behaviour is carried forward for now
     _close();
     return ERR_OK;
 }
@@ -954,8 +921,8 @@ int8_t AsyncClient::_recv(tcp_pcb* pcb, pbuf* pb, int8_t err) {
             }
             if(!_ack_pcb) {
                 _rx_ack_len += b->len;
-            } else if(_pcb) {
-                _tcp_recved(_pcb, _pcb_slot, b->len);
+            } else if(is_valid(_pcb_ref)) {
+                _tcp_recved(_pcb_ref, b->len);
             }
             pbuf_free(b);
         }
@@ -964,12 +931,13 @@ int8_t AsyncClient::_recv(tcp_pcb* pcb, pbuf* pb, int8_t err) {
 }
 
 int8_t AsyncClient::_poll(tcp_pcb* pcb){
-    if(!_pcb){
+    if(!is_valid(_pcb_ref)){
         log_w("pcb is NULL");
         return ERR_OK;
     }
-    if(pcb != _pcb){
-        log_e("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)_pcb);
+    if(pcb != *_pcb_ref){
+        // something has gone horribly wrong
+        log_e("0x%08x != 0x%08x", (uint32_t)pcb, (uint32_t)*pcb_ref);
         return ERR_OK;
     }
 
@@ -1021,10 +989,10 @@ void AsyncClient::stop() {
 }
 
 bool AsyncClient::free(){
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return true;
     }
-    if(_pcb->state == 0 || _pcb->state > 4) {
+    if((*_pcb_ref)->state == 0 || (*_pcb_ref)->state > 4) {
         return true;
     }
     return false;
@@ -1062,56 +1030,56 @@ void AsyncClient::setAckTimeout(uint32_t timeout){
 }
 
 void AsyncClient::setNoDelay(bool nodelay){
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return;
     }
     if(nodelay) {
-        tcp_nagle_disable(_pcb);
+        tcp_nagle_disable((*_pcb_ref));
     } else {
-        tcp_nagle_enable(_pcb);
+        tcp_nagle_enable((*_pcb_ref));
     }
 }
 
 bool AsyncClient::getNoDelay(){
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return false;
     }
-    return tcp_nagle_disabled(_pcb);
+    return tcp_nagle_disabled((*_pcb_ref));
 }
 
 uint16_t AsyncClient::getMss(){
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return 0;
     }
-    return tcp_mss(_pcb);
+    return tcp_mss((*_pcb_ref));
 }
 
 uint32_t AsyncClient::getRemoteAddress() {
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return 0;
     }
-    return _pcb->remote_ip.u_addr.ip4.addr;
+    return (*_pcb_ref)->remote_ip.u_addr.ip4.addr;
 }
 
 uint16_t AsyncClient::getRemotePort() {
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return 0;
     }
-    return _pcb->remote_port;
+    return (*_pcb_ref)->remote_port;
 }
 
 uint32_t AsyncClient::getLocalAddress() {
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return 0;
     }
-    return _pcb->local_ip.u_addr.ip4.addr;
+    return (*_pcb_ref)->local_ip.u_addr.ip4.addr;
 }
 
 uint16_t AsyncClient::getLocalPort() {
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return 0;
     }
-    return _pcb->local_port;
+    return (*_pcb_ref)->local_port;
 }
 
 IPAddress AsyncClient::remoteIP() {
@@ -1131,45 +1099,45 @@ uint16_t AsyncClient::localPort() {
 }
 
 uint8_t AsyncClient::state() {
-    if(!_pcb) {
+    if(!is_valid(_pcb_ref)) {
         return 0;
     }
-    return _pcb->state;
+    return (*_pcb_ref)->state;
 }
 
 bool AsyncClient::connected(){
-    if (!_pcb) {
+    if (!is_valid(_pcb_ref)) {
         return false;
     }
-    return _pcb->state == 4;
+    return (*_pcb_ref)->state == 4;
 }
 
 bool AsyncClient::connecting(){
-    if (!_pcb) {
+    if (!is_valid(_pcb_ref)) {
         return false;
     }
-    return _pcb->state > 0 && _pcb->state < 4;
+    return (*_pcb_ref)->state > 0 && (*_pcb_ref)->state < 4;
 }
 
 bool AsyncClient::disconnecting(){
-    if (!_pcb) {
+    if (!is_valid(_pcb_ref)) {
         return false;
     }
-    return _pcb->state > 4 && _pcb->state < 10;
+    return (*_pcb_ref)->state > 4 && (*_pcb_ref)->state < 10;
 }
 
 bool AsyncClient::disconnected(){
-    if (!_pcb) {
+    if (!is_valid(_pcb_ref)) {
         return true;
     }
-    return _pcb->state == 0 || _pcb->state == 10;
+    return (*_pcb_ref)->state == 0 || (*_pcb_ref)->state == 10;
 }
 
 bool AsyncClient::freeable(){
-    if (!_pcb) {
+    if (!is_valid(_pcb_ref)) {
         return true;
     }
-    return _pcb->state == 0 || _pcb->state > 4;
+    return (*_pcb_ref)->state == 0 || (*_pcb_ref)->state > 4;
 }
 
 bool AsyncClient::canSend(){
@@ -1290,7 +1258,7 @@ void AsyncServer::begin(){
     }
     int8_t err;
     _pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-    if (!_pcb){
+    if (_pcb == NULL){
         log_e("_pcb == NULL");
         return;
     }
@@ -1301,27 +1269,29 @@ void AsyncServer::begin(){
     err = _tcp_bind(_pcb, &local_addr, _port);
 
     if (err != ERR_OK) {
-        _tcp_close(_pcb, -1);
+        _tcp_close(std::make_shared<tcp_pcb*>(_pcb));
         log_e("bind error: %d", err);
         return;
     }
 
+    tcp_arg(_pcb, (void*) this);
+    tcp_accept(_pcb, &_s_accept);
+
     static uint8_t backlog = 5;
     _pcb = _tcp_listen_with_backlog(_pcb, backlog);
-    if (!_pcb) {
+    if (_pcb == NULL) {
         log_e("listen_pcb == NULL");
         return;
     }
-    tcp_arg(_pcb, (void*) this);
-    tcp_accept(_pcb, &_s_accept);
 }
 
 void AsyncServer::end(){
     if(_pcb){
         tcp_arg(_pcb, NULL);
-        tcp_accept(_pcb, NULL);
-        if(tcp_close(_pcb) != ERR_OK){
-            _tcp_abort(_pcb, -1);
+        tcp_accept(_pcb, NULL);        
+        std::shared_ptr<tcp_pcb*> spcb = std::make_shared<tcp_pcb*>(_pcb);
+        if(_tcp_close(spcb) != ERR_OK){
+            _tcp_abort(spcb);
         }
         _pcb = NULL;
     }

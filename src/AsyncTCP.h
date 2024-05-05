@@ -25,6 +25,7 @@
 #include "IPAddress.h"
 #include "sdkconfig.h"
 #include <functional>
+#include <memory>
 extern "C" {
     #include "freertos/semphr.h"
     #include "lwip/pbuf.h"
@@ -167,11 +168,10 @@ class AsyncClient {
     static void _s_dns_found(const char *name, struct ip_addr *ipaddr, void *arg);
 
     int8_t _recv(tcp_pcb* pcb, pbuf* pb, int8_t err);
-    tcp_pcb * pcb(){ return _pcb; }
+    tcp_pcb * pcb(){ return *_pcb_ref; }
 
   protected:
-    tcp_pcb* _pcb;
-    int  _pcb_slot;
+    std::shared_ptr<tcp_pcb*> _pcb_ref;
 
     AcConnectHandler _connect_cb;
     void* _connect_cb_arg;
