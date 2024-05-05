@@ -322,7 +322,7 @@ static int8_t _tcp_connected(void * arg, tcp_pcb * pcb, int8_t err) {
         e->arg = arg;
         e->connected.pcb = pcb;
         e->connected.err = err;
-        if (!_prepend_async_event(&e)) {
+        if (!_send_async_event(&e)) {
             free((void*)(e));
         }
     }
@@ -388,7 +388,11 @@ static void _tcp_error(void * arg, int8_t err) {
         e->event = LWIP_TCP_ERROR;
         e->arg = arg;
         e->error.err = err;
-        if (!_send_async_event(&e)) {
+        // The associated pcb is now invalid
+        // TODO: there is a race here if the AsyncClient is processing an event on this PCB already
+        // To fix this, we'll have to have 'arg' point at the _active_pcbs array,
+        // and have that array store the client as well.
+        if (!_prepend_async_event(&e)) {
             free((void*)(e));
         }
     }
@@ -412,14 +416,14 @@ static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * ar
     }
 }
 
-//Used to switch out from LwIP thread
+// Runs on LWIP thread
 static int8_t _tcp_accept(void * arg, AsyncClient * client) {
     lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
     if (NULL != e) {
         e->event = LWIP_TCP_ACCEPT;
         e->arg = arg;
         e->accept.client = client;
-        if (!_prepend_async_event(&e)) {
+        if (!_send_async_event(&e)) {
             free((void*)(e));
         }
     }
@@ -909,12 +913,11 @@ int8_t AsyncClient::_connected(void* pcb, int8_t err){
 
 void AsyncClient::_error(int8_t err) {
     if(_pcb){
-        // WM: is this safe to do here???
-        _teardown_pcb(_pcb);
         _release_pcb(_pcb_slot, _pcb);
         _pcb = NULL;
         _pcb_slot = -1;
     }
+    _tcp_clear_events(this);
     if(_error_cb) {
         _error_cb(_error_cb_arg, this, err);
     }
@@ -925,6 +928,9 @@ void AsyncClient::_error(int8_t err) {
 
 //In Async Thread
 int8_t AsyncClient::_fin(tcp_pcb* pcb, int8_t err) {
+    // WM: This isn't strictly correct -- we should instead pass this to a callback
+    // _fin() merely indicates that the remote end is closing, it doesn't require us
+    // to close until we're done sending.
     _close();
     return ERR_OK;
 }
@@ -1342,7 +1348,7 @@ int8_t AsyncServer::_accept(tcp_pcb* pcb, int8_t err){
             tcp_abort(pcb);
         }
     }
-    log_e("FAIL");
+    log_e("TCP ACCEPT FAIL");
     return ERR_OK;
 }
 
