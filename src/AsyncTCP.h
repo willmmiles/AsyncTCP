@@ -79,11 +79,11 @@ class AsyncClient {
     AsyncClient(tcp_pcb* pcb = 0);
     ~AsyncClient();
 
-    AsyncClient & operator=(const AsyncClient &other);
-    AsyncClient & operator+=(const AsyncClient &other);
+    // Not copyable
+    AsyncClient(const AsyncClient&) = delete;
+    AsyncClient& operator=(const AsyncClient &other) = delete;
 
     bool operator==(const AsyncClient &other);
-
     bool operator!=(const AsyncClient &other) {
       return !(*this == other);
     }
@@ -161,7 +161,6 @@ class AsyncClient {
     static int8_t _s_poll(void *arg, struct tcp_pcb *tpcb);
     static int8_t _s_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *pb, int8_t err);
     static int8_t _s_fin(void *arg, struct tcp_pcb *tpcb, int8_t err);
-    static int8_t _s_lwip_fin(void *arg, struct tcp_pcb *tpcb, int8_t err);
     static void _s_error(void *arg, int8_t err);
     static int8_t _s_sent(void *arg, struct tcp_pcb *tpcb, uint16_t len);
     static int8_t _s_connected(void* arg, void* tpcb, int8_t err);
@@ -172,7 +171,7 @@ class AsyncClient {
 
   protected:
     tcp_pcb* _pcb;
-    int8_t  _closed_slot;
+    int  _pcb_slot;
 
     AcConnectHandler _connect_cb;
     void* _connect_cb_arg;
@@ -201,19 +200,12 @@ class AsyncClient {
     uint16_t _connect_port;
 
     int8_t _close();
-    void _free_closed_slot();
-    void _allocate_closed_slot();
     int8_t _connected(void* pcb, int8_t err);
     void _error(int8_t err);
     int8_t _poll(tcp_pcb* pcb);
     int8_t _sent(tcp_pcb* pcb, uint16_t len);
     int8_t _fin(tcp_pcb* pcb, int8_t err);
-    int8_t _lwip_fin(tcp_pcb* pcb, int8_t err);
     void _dns_found(struct ip_addr *ipaddr);
-
-  public:
-    AsyncClient* prev;
-    AsyncClient* next;
 };
 
 class AsyncServer {
