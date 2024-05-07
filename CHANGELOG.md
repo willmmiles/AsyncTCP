@@ -2,6 +2,14 @@
 
 Newest at top
 
+## 2024-05-07 - v1.2.2
+
+**Commit** [c4d673de84572bd50d359f54e0cbbe90bc2c9404](https://github.com/willmmiles/AsyncTCP/commit/c4d673de84572bd50d359f54e0cbbe90bc2c9404)
+
+* Expand "close_slot" system to ensure no races or deadlocks in handling close data
+* Fix memory leak closing socket with unread data
+* Fix creating an empty AsyncClient on failed connect, ie. when no socket handles are available
+
 ## 2024-04-07
 
 **Commit** [375dee3366c60f732e9a9ce9383ad0fb5ab44d78](https://github.com/willmmiles/AsyncTCP/commit/375dee3366c60f732e9a9ce9383ad0fb5ab44d78)
