@@ -89,7 +89,7 @@ static void _tcp_error(void * arg, int8_t err);
 static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
 
 // Global variables
-static xQueueHandle _async_queue;
+static QueueHandle_t _async_queue;
 static TaskHandle_t _async_service_task_handle = NULL;
 SemaphoreHandle_t _active_pcbs_lock;
 const int _max_active_pcbs = (2*CONFIG_LWIP_MAX_ACTIVE_TCP);
