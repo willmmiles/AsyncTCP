@@ -2,6 +2,12 @@
 
 Newest at top
 
+## 2024-06-13 - v1.2.3
+
+**Commit** [8171a7263385860a4e512d7d124d450774e05f38](https://github.com/willmmiles/AsyncTCP/commit/8171a7263385860a4e512d7d124d450774e05f38)
+
+* Merge [Arduino Core v3.0.x fix from upstream](https://github.com/me-no-dev/AsyncTCP/pull/183)
+
 ## 2024-05-07 - v1.2.2
 
 **Commit** [c4d673de84572bd50d359f54e0cbbe90bc2c9404](https://github.com/willmmiles/AsyncTCP/commit/c4d673de84572bd50d359f54e0cbbe90bc2c9404)
