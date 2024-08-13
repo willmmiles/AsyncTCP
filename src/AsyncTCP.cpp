@@ -31,10 +31,8 @@ extern "C"{
 }
 #include "esp_task_wdt.h"
 
-//#define ASYNC_TCP_DEBUG
 #ifdef ASYNC_TCP_DEBUG
-#define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__);
-//log_d(__VA_ARGS__)
+#define DEBUG_PRINTF(...) log_d(__VA_ARGS__)
 #else
 #define DEBUG_PRINTF(...)
 #endif
