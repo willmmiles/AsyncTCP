@@ -79,9 +79,56 @@ struct lwip_event_packet_t {
         };
 };
 
+// Forward declarations for TCP event callbacks
+static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, err_t err);
+static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len);
+static void _tcp_error(void * arg, err_t err);
+static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
+
+// Global variables
+static SemaphoreHandle_t _async_queue_mutex = nullptr;
+static lwip_event_packet_t* _async_queue_head = nullptr, *_async_queue_tail = nullptr;
+static TaskHandle_t _async_service_task_handle = NULL;
+static lwip_event_packet_t* _free_list = nullptr;
+
+namespace {
+    class queue_mutex_guard {
+        bool holds_mutex;
+        public:            
+            inline queue_mutex_guard() : holds_mutex(xSemaphoreTakeRecursive(_async_queue_mutex, portMAX_DELAY)) {};
+            inline ~queue_mutex_guard() { if (holds_mutex) xSemaphoreGiveRecursive(_async_queue_mutex); };
+            inline explicit operator bool() const { return holds_mutex; };
+            queue_mutex_guard(const queue_mutex_guard&) = delete;
+            queue_mutex_guard(queue_mutex_guard&&) = delete;
+            queue_mutex_guard& operator=(const queue_mutex_guard&) = delete;
+            queue_mutex_guard& operator=(queue_mutex_guard&&) = delete;
+    };
+}
+
+static inline bool _init_async_event_queue(){
+    if(!_async_queue_mutex){
+        _async_queue_mutex = xSemaphoreCreateRecursiveMutex();
+        if(!_async_queue_mutex){
+            return false;
+        }
+    }
+    return true;
+}
+
+
 // helper function
 static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client, tcp_pcb* pcb) {
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
+    lwip_event_packet_t * e;
+    {
+        queue_mutex_guard guard;
+        if (_free_list) {
+            e = _free_list;
+            _free_list = e->next;
+        } else {
+            e = nullptr;
+        }
+    }
+    if (!e) e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
     e->next = nullptr;
     e->event = event;
     e->client = client;
@@ -98,39 +145,12 @@ static void _free_event(lwip_event_packet_t* evpkt) {
         // We must free the packet buffer
         pbuf_free(evpkt->recv.pb);
     }
-    free(evpkt);
+    queue_mutex_guard guard;
+    evpkt->next = _free_list;
+    _free_list = evpkt;
+    //free(evpkt);
 }
 
-// Forward declarations for TCP event callbacks
-static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, err_t err);
-static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len);
-static void _tcp_error(void * arg, err_t err);
-static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
-
-// Global variables
-static SemaphoreHandle_t _async_queue_mutex = nullptr;
-static lwip_event_packet_t* _async_queue_head = nullptr, *_async_queue_tail = nullptr;
-static TaskHandle_t _async_service_task_handle = NULL;
-
-namespace {
-    class queue_mutex_guard {
-        bool holds_mutex;
-        public:            
-            inline queue_mutex_guard() : holds_mutex(xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)) {};
-            inline ~queue_mutex_guard() { if (holds_mutex) xSemaphoreGive(_async_queue_mutex); };
-            inline explicit operator bool() const { return holds_mutex; };
-    };
-}
-
-static inline bool _init_async_event_queue(){
-    if(!_async_queue_mutex){
-        _async_queue_mutex = xSemaphoreCreateMutex();
-        if(!_async_queue_mutex){
-            return false;
-        }
-    }
-    return true;
-}
 
 static inline bool _send_async_event(lwip_event_packet_t * e){
     queue_mutex_guard guard;
