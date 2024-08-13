@@ -308,9 +308,9 @@ static void _async_service_task(void *pvParameters){
 #endif
         }
         // queue is empty
-        DEBUG_PRINTF("Async task waiting 0x%08\n",(intptr_t)_async_queue_head);
-        auto q = ulTaskNotifyTake(pdTRUE, 1000);
-        DEBUG_PRINTF("Async task woke = %d 0x%08x\n",q, (intptr_t)_async_queue_head);
+        // DEBUG_PRINTF("Async task waiting 0x%08\n",(intptr_t)_async_queue_head);
+        auto q = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // DEBUG_PRINTF("Async task woke = %d 0x%08x\n",q, (intptr_t)_async_queue_head);
     }
     vTaskDelete(NULL);
     _async_service_task_handle = NULL;
