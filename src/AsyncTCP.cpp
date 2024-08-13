@@ -141,9 +141,13 @@ static inline bool _send_async_event(lwip_event_packet_t * e){
             _async_queue_head = e;            
         }
         _async_queue_tail = e;
+#ifdef ASYNC_TCP_DEBUG        
         uint32_t n;
         xTaskNotifyAndQuery(_async_service_task_handle, 1, eIncrement, &n);
         DEBUG_PRINTF("SAA: 0x%08x -> 0x%08x 0x%08x - %d\n",(intptr_t) e, (intptr_t)_async_queue_head, (intptr_t)_async_queue_tail,n);
+#else
+        xTaskNotifyGive(_async_service_task_handle);
+#endif
     }
     return (bool) guard;
 }
@@ -157,9 +161,13 @@ static inline bool _prepend_async_event(lwip_event_packet_t * e) {
             _async_queue_tail = e;            
         }
         _async_queue_head = e;
+#ifdef ASYNC_TCP_DEBUG        
         uint32_t n;
         xTaskNotifyAndQuery(_async_service_task_handle, 1, eIncrement, &n);
         DEBUG_PRINTF("PAA: 0x%08x -> 0x%08x 0x%08x - %d\n",(intptr_t) e, (intptr_t)_async_queue_head, (intptr_t)_async_queue_tail,n);
+#else
+        xTaskNotifyGive(_async_service_task_handle);
+#endif   
     }
     return (bool) guard;
 }
