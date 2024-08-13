@@ -42,7 +42,7 @@ extern "C"{
  * */
 
 typedef enum {
-    LWIP_TCP_SENT, LWIP_TCP_RECV, LWIP_TCP_FIN, LWIP_TCP_ERROR, LWIP_TCP_POLL, LWIP_TCP_CLEAR, LWIP_TCP_ACCEPT, LWIP_TCP_CONNECTED, LWIP_TCP_DNS
+    LWIP_TCP_SENT, LWIP_TCP_RECV, LWIP_TCP_FIN, LWIP_TCP_ERROR, LWIP_TCP_POLL, LWIP_TCP_ACCEPT, LWIP_TCP_CONNECTED, LWIP_TCP_DNS
 } lwip_event_t;
 
 struct lwip_event_packet_t {
@@ -245,10 +245,7 @@ static void _teardown_pcb(tcp_pcb* pcb) {
 
 void AsyncClient_detail::handle_async_event(lwip_event_packet_t * e){
     // Special cases first
-    if(e->event == LWIP_TCP_CLEAR){
-        DEBUG_PRINTF("-X: 0x%08x %d\n", e->client);
-        _remove_events_for(e->client);
-    } else if(e->event == LWIP_TCP_ERROR){
+    if(e->event == LWIP_TCP_ERROR){
         DEBUG_PRINTF("-E: 0x%08x %d\n", e->client, e->error.err);
         // Special case: pcb is now invalid
         // _remove_events_for(e->client);  // there oughtn't be any
