@@ -79,9 +79,31 @@ struct lwip_event_packet_t {
         };
 };
 
+// Forward declarations for TCP event callbacks
+static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, err_t err);
+static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len);
+static void _tcp_error(void * arg, err_t err);
+static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
+
 // helper function
 static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client, tcp_pcb* pcb) {
+    // Validation check
+    if (pcb && (client->pcb() != pcb)) {
+        // Client structure is corrupt?
+        tcp_abort(pcb);
+        _tcp_error(client, ERR_ARG);
+        return nullptr;
+    }
+
     lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
+
+    if (!e) {
+        // Allocation fail - abort client and give up
+        if (pcb) tcp_abort(pcb);
+        _tcp_error(client, ERR_MEM);
+        return nullptr;
+    }
+    
     e->next = nullptr;
     e->event = event;
     e->client = client;
@@ -101,11 +123,6 @@ static void _free_event(lwip_event_packet_t* evpkt) {
     free(evpkt);
 }
 
-// Forward declarations for TCP event callbacks
-static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, err_t err);
-static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len);
-static void _tcp_error(void * arg, err_t err);
-static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
 
 // Global variables
 static SemaphoreHandle_t _async_queue_mutex = nullptr;
@@ -215,7 +232,7 @@ static bool _remove_events_for(AsyncClient* client){
 // Detail class for interacting with AsyncClient internals, but without exposing the API to other parts of the program
 class AsyncClient_detail {
     public:
-    static inline void invalidate_pcb(AsyncClient& client) { client._pcb = nullptr; };
+    static inline lwip_event_packet_t* invalidate_pcb(AsyncClient& client) { client._pcb = nullptr; return client._end_event; };
     static void __attribute__((visibility("internal"))) handle_async_event(lwip_event_packet_t* event);
 };
 
@@ -247,22 +264,24 @@ void AsyncClient_detail::handle_async_event(lwip_event_packet_t * e){
     // Special cases first
     if(e->event == LWIP_TCP_ERROR){
         DEBUG_PRINTF("-E: 0x%08x %d\n", e->client, e->error.err);
-        // Special case: pcb is now invalid
-        // _remove_events_for(e->client);  // there oughtn't be any
+        // Special case: pcb is now invalid, and will have been null'd out by the lwip thread
         if (e->client)
             e->client->_error(e->error.err);
+        return;  // do not free this event, it belongs to the client
     } 
     // Now check for client pointer    
     else if(e->client->pcb() == NULL){
-        // do nothing when pcb is NULL - invalidated by error
+        // This can only happen if event processing is racing with closing or destruction in a third task.
+        // Drop the event and do nothing.
         DEBUG_PRINTF("event client pcb == NULL: 0x%08x\n", e->client);
     }
 #ifdef ASYNCTCP_VALIDATE_PCB
     else if (e->client.pcb() != e->pcb) {
-        log_e("event client pcb mismatch: 0x%08x -> 0x%08x vs 0x%08x\n", e->client,e->client.pcb(),e->pcb);
+        log_e("event client pcb mismatch: 0x%08x -> 0x%08x vs 0x%08x\n", e->client,e->client.pcb(),e->pcb);        
     }
 #endif
     // OK, process other events
+    // TODO: is a switch-case more code efficient?
     else if(e->event == LWIP_TCP_RECV){
         DEBUG_PRINTF("-R: 0x%08x\n", e->client->_pcb);
         e->client->_recv(e->recv.pb, e->recv.err);
@@ -342,32 +361,29 @@ static bool _start_async_task(){
 static int8_t _tcp_connected(void * arg, tcp_pcb * pcb, int8_t err) {
     DEBUG_PRINTF("+C: 0x%08x\n", pcb);
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_CONNECTED, client, pcb);
-    if ((NULL != e) && (client->pcb() == pcb)) {
+    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_CONNECTED, client, pcb);    
+    if (e) {
         e->connected.err = err;
-        if (!_send_async_event(e)) {
-            _free_event(e);
-        }
+        _send_async_event(e);
     }
     return ERR_OK;
+
 }
 
 static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb) {
     DEBUG_PRINTF("+P: 0x%08x\n", pcb);
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
     lwip_event_packet_t * e = _alloc_event(LWIP_TCP_POLL, client, pcb);
-    if ((NULL != e) && (client->pcb() == pcb)) {
-        if (!_send_async_event(e)) {
-            _free_event(e);
-        }
-    }
+    if (e != nullptr) {
+        _send_async_event(e);
+    } 
     return ERR_OK;
 }
 
 static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, int8_t err) {
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
     lwip_event_packet_t * e = _alloc_event(LWIP_TCP_RECV, client, pcb);
-    if ((NULL != e) && (client->pcb() == pcb)) {
+    if (e != nullptr) {
         if(pb){
             DEBUG_PRINTF("+R: 0x%08x\n", pcb);
             e->recv.pb = pb;
@@ -376,11 +392,9 @@ static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, int8_
             DEBUG_PRINTF("+F: 0x%08x -> 0x%08x\n", pcb, arg);
             e->event = LWIP_TCP_FIN;
             e->fin.err = err;
-        }
-        if (!_send_async_event(e)) {
-            _free_event(e);
-        }
-    }
+        }        
+        _send_async_event(e);
+    } 
     return ERR_OK;
 }
 
@@ -388,11 +402,9 @@ static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len) {
     DEBUG_PRINTF("+S: 0x%08x\n", pcb);
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
     lwip_event_packet_t * e = _alloc_event(LWIP_TCP_SENT, client, pcb);
-    if ((NULL != e) && (client->pcb() == pcb)) {
+    if (e != nullptr) {
         e->sent.len = len;
-        if (!_send_async_event(e)) {
-            _free_event(e);
-        }
+        _send_async_event(e);
     }
     return ERR_OK;
 }
@@ -402,43 +414,39 @@ static void _tcp_error(void * arg, int8_t err) {
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
     assert(client);
     // The associated pcb is now invalid and will soon be deallocated
-    AsyncClient_detail::invalidate_pcb(*client);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_ERROR, client, nullptr);    
-    if (NULL != e) {
-        e->error.err = err;
-        if (!_prepend_async_event(e)) {
-            _free_event(e);
-        }
-    }
+    // We call on the preallocated end event from the client object
+    lwip_event_packet_t * e = AsyncClient_detail::invalidate_pcb(*client);    
+    assert(e);
+    e->error.err = err;
+    _remove_events_for(client); // FUTURE: we could hold the lock the whole time
+    _prepend_async_event(e);
 }
 
 static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * arg) {
     DEBUG_PRINTF("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
     auto client = reinterpret_cast<AsyncClient*>(arg);
     lwip_event_packet_t * e = _alloc_event(LWIP_TCP_DNS, client, client->pcb());
-    if (NULL != e) {
+    if (e != nullptr) {
         e->dns.name = name;
         if (ipaddr) {
             memcpy(&e->dns.addr, ipaddr, sizeof(struct ip_addr));
         } else {
             memset(&e->dns.addr, 0, sizeof(e->dns.addr));
         }
-        if (!_send_async_event(e)) {
-            _free_event(e);
-        }
+        _send_async_event(e);
     }
 }
 
 // Runs on LWIP thread
 static int8_t _tcp_accept(AsyncServer* server, AsyncClient * client) {
     lwip_event_packet_t * e = _alloc_event(LWIP_TCP_ACCEPT, client, client->pcb());
-    if (NULL != e) {
+    if (e) {
         e->accept.server = server;
-        if (!_send_async_event(e)) {
-            _free_event(e);
-        }
-    }
-    return ERR_OK;
+        _send_async_event(e);
+        return ERR_OK;
+    } else {
+        return ERR_MEM;
+    }    
 }
 
 /*
@@ -612,7 +620,9 @@ static tcp_pcb * _tcp_listen_with_backlog(tcp_pcb * pcb, uint8_t backlog) {
  */
 
 AsyncClient::AsyncClient(tcp_pcb* pcb)
-: _connect_cb(0)
+: _pcb(pcb)
+, _end_event(nullptr)
+, _connect_cb(0)
 , _connect_cb_arg(0)
 , _discard_cb(0)
 , _discard_cb_arg(0)
@@ -633,18 +643,26 @@ AsyncClient::AsyncClient(tcp_pcb* pcb)
 , _ack_timeout(ASYNC_MAX_ACK_TIME)
 , _connect_port(0)
 {
-    _pcb = pcb;
     if(_pcb){
-        _register_pcb(_pcb, this);
-        _rx_last_packet = millis();
-    }
+        _end_event = _alloc_event(LWIP_TCP_ERROR, this, _pcb);
+        if (_end_event) {
+            _register_pcb(_pcb, this);
+            _rx_last_packet = millis();        
+        } else {
+            // Out of memory!!
+            // Swallow this PCB, producing a null client object
+            tcp_abort(_pcb);
+            _pcb = nullptr;
+        }
+    }    
     DEBUG_PRINTF("+AC: 0x%08x -> 0x%08x\n", _pcb, (intptr_t)this);
 }
 
-AsyncClient::~AsyncClient(){
+AsyncClient::~AsyncClient(){    
     if(_pcb) {
         _close();
     }
+    if (_end_event) _free_event(_end_event);
     DEBUG_PRINTF("-AC: 0x%08x -> 0x%08x\n", _pcb, (intptr_t)this);
 }
 
@@ -1257,13 +1275,27 @@ int8_t AsyncServer::_accept(tcp_pcb* pcb, int8_t err){
     if (pcb) {
         if(_connect_cb){
             AsyncClient *c = new AsyncClient(pcb);
-            if(c){
+            if (c && c->pcb()) {
                 c->setNoDelay(_noDelay);
-                return _tcp_accept(this, c);
+                if (_tcp_accept(this, c) == ERR_OK) return ERR_OK;  // success
+            } 
+            if (c->pcb()) {
+                // Couldn't allocate accept event
+                // We can't let the client object call in to close, as we're on the LWIP thread; it could deadlock trying to RPC to itself
+                AsyncClient_detail::invalidate_pcb(*c);
+                tcp_abort(pcb);
+            }            
+            if (c) {
+                // Couldn't complete setup
+                // pcb has already been aborted
+                delete c;
+                pcb = nullptr;
             }
-        }        
-        if(tcp_close(pcb) != ERR_OK){
-            tcp_abort(pcb);
+        }
+        if (pcb) {
+            if(tcp_close(pcb) != ERR_OK){
+                tcp_abort(pcb);
+            }
         }
     }
     log_e("TCP ACCEPT FAIL");
