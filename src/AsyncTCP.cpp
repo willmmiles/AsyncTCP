@@ -90,6 +90,7 @@ static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client
     // Validation check
     if (pcb && (client->pcb() != pcb)) {
         // Client structure is corrupt?
+        log_e("Client mismatch allocating event for 0x%08x 0x%08x vs 0x%08x\n",(intptr_t)client, (intptr_t)pcb,client->pcb());
         tcp_abort(pcb);
         _tcp_error(client, ERR_ARG);
         return nullptr;
@@ -99,6 +100,7 @@ static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client
 
     if (!e) {
         // Allocation fail - abort client and give up
+        log_e("OOM allocating event for 0x%08x 0x%08x\n",(intptr_t)client, (intptr_t)pcb);
         if (pcb) tcp_abort(pcb);
         _tcp_error(client, ERR_MEM);
         return nullptr;
