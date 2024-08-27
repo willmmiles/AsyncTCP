@@ -34,10 +34,6 @@ extern "C" {
 //CONFIG_ASYNC_TCP_DIAGNOSTICS
 //#define CONFIG_ASYNC_TCP_DIAGNOSTICS 1
 
-#ifndef CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE
-#define CONFIG_ASYNC_TCP_EVENT_QUEUE_SIZE (CONFIG_LWIP_MAX_ACTIVE_TCP * 4)
-#endif
-
 //If core is not defined, then we are running in Arduino or PIO
 #ifndef CONFIG_ASYNC_TCP_RUNNING_CORE
 #define CONFIG_ASYNC_TCP_RUNNING_CORE -1 //any available core
@@ -73,6 +69,8 @@ typedef std::function<void(void*, AsyncClient*, uint32_t time)> AcTimeoutHandler
 
 struct tcp_pcb;
 struct ip_addr;
+class AsyncClient_detail;
+struct lwip_event_packet_t;
 
 class AsyncClient {
   public:
@@ -82,6 +80,10 @@ class AsyncClient {
     // Not copyable
     AsyncClient(const AsyncClient&) = delete;
     AsyncClient& operator=(const AsyncClient &other) = delete;
+    // Not movable, either
+    AsyncClient(AsyncClient&&) = delete;
+    AsyncClient& operator=(AsyncClient &&other) = delete;
+
 
     bool operator==(const AsyncClient &other);
     bool operator!=(const AsyncClient &other) {
@@ -157,21 +159,11 @@ class AsyncClient {
     static UBaseType_t getStackHighWaterMark();
     #endif
 
-    //Do not use any of the functions below!
-    static int8_t _s_poll(void *arg, struct tcp_pcb *tpcb);
-    static int8_t _s_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *pb, int8_t err);
-    static int8_t _s_fin(void *arg, struct tcp_pcb *tpcb, int8_t err);
-    static void _s_error(void *arg, int8_t err);
-    static int8_t _s_sent(void *arg, struct tcp_pcb *tpcb, uint16_t len);
-    static int8_t _s_connected(void* arg, void* tpcb, int8_t err);
-    static void _s_dns_found(const char *name, struct ip_addr *ipaddr, void *arg);
-
-    int8_t _recv(tcp_pcb* pcb, pbuf* pb, int8_t err);
     tcp_pcb * pcb(){ return _pcb; }
 
   protected:
     tcp_pcb* _pcb;
-    int  _pcb_slot;
+    lwip_event_packet_t* _end_event;
 
     AcConnectHandler _connect_cb;
     void* _connect_cb_arg;
@@ -199,13 +191,16 @@ class AsyncClient {
     uint32_t _ack_timeout;
     uint16_t _connect_port;
 
+    friend class AsyncClient_detail;
     int8_t _close();
-    int8_t _connected(void* pcb, int8_t err);
+    int8_t _connected(int8_t err);
     void _error(int8_t err);
-    int8_t _poll(tcp_pcb* pcb);
-    int8_t _sent(tcp_pcb* pcb, uint16_t len);
-    int8_t _fin(tcp_pcb* pcb, int8_t err);
+    int8_t _poll();
+    int8_t _sent(uint16_t len);
+    int8_t _fin(int8_t err);
+    int8_t _recv(pbuf* pb, int8_t err);
     void _dns_found(struct ip_addr *ipaddr);
+    int8_t _recved(size_t len);
 };
 
 class AsyncServer {
@@ -232,6 +227,7 @@ class AsyncServer {
     AcConnectHandler _connect_cb;
     void* _connect_cb_arg;
 
+    friend class AsyncClient_detail;
     int8_t _accept(tcp_pcb* newpcb, int8_t err);
     int8_t _accepted(AsyncClient* client);
 };
