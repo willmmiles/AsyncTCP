@@ -20,7 +20,7 @@
     "type": "git",
     "url": "https://github.com/willmmiles/AsyncTCP.git"
   },
-  "version": "1.2.3",
+  "version": "1.3.0",
   "license": "LGPL-3.0",
   "frameworks": "arduino",
   "platforms": "espressif32",

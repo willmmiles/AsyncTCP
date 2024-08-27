@@ -2,6 +2,14 @@
 
 Newest at top
 
+## 2024-08-27 - v1.3.0
+
+**Commit** [faba3b5bf410ec503830f9a07cd694c0b6b98b2b](https://github.com/willmmiles/AsyncTCP/commit/faba3b5bf410ec503830f9a07cd694c0b6b98b2b)
+
+* Implement new queuing and close monitoring solution
+* Ensure client objects are notified about errors
+* Fails gracefully under heavy load
+
 ## 2024-06-13 - v1.2.3
 
 **Commit** [8171a7263385860a4e512d7d124d450774e05f38](https://github.com/willmmiles/AsyncTCP/commit/8171a7263385860a4e512d7d124d450774e05f38)
