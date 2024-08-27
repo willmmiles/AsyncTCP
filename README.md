@@ -39,9 +39,11 @@ If the value from this function is close to zero, increasing CONFIG_ASYNC_TCP_TA
 static UBaseType_t AsyncClient::getStackHighWaterMark()
 ```
 
-### 
+## Known issues
 
-### Async TCP Library for ESP32 Arduino
+There is a potential race between AsyncClient::space() and an incoming error event, where the LwIP task might free the tcp_pcb while a client task is accessing it.  We are (currently) accepting this risk as the cost of synchronizing across the tcp_pcb access is very large compared to the lookup cost, and error events are very infrequent in normal operation.
+
+## Async TCP Library for ESP32 Arduino
 
 [![Join the chat at https://gitter.im/me-no-dev/ESPAsyncWebServer](https://badges.gitter.im/me-no-dev/ESPAsyncWebServer.svg)](https://gitter.im/me-no-dev/ESPAsyncWebServer?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
