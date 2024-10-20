@@ -70,7 +70,7 @@ typedef std::function<void(void*, AsyncClient*, uint32_t time)> AcTimeoutHandler
 struct tcp_pcb;
 struct ip_addr;
 class AsyncClient_detail;
-struct lwip_event_packet_t;
+struct AsyncClient_event_t;
 
 class AsyncClient {
   public:
@@ -163,7 +163,7 @@ class AsyncClient {
 
   protected:
     tcp_pcb* _pcb;
-    lwip_event_packet_t* _end_event;
+    AsyncClient_event_t* _end_event;
 
     AcConnectHandler _connect_cb;
     void* _connect_cb_arg;

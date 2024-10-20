@@ -45,8 +45,8 @@ typedef enum {
     LWIP_TCP_SENT, LWIP_TCP_RECV, LWIP_TCP_FIN, LWIP_TCP_ERROR, LWIP_TCP_POLL, LWIP_TCP_ACCEPT, LWIP_TCP_CONNECTED, LWIP_TCP_DNS
 } lwip_event_t;
 
-struct lwip_event_packet_t {
-        lwip_event_packet_t* next;
+struct AsyncClient_event_t {
+        AsyncClient_event_t* next;
         lwip_event_t event;
         AsyncClient *client;
 #ifdef ASYNCTCP_VALIDATE_PCB
@@ -86,7 +86,7 @@ static void _tcp_error(void * arg, err_t err);
 static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb);
 
 // helper function
-static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client, tcp_pcb* pcb) {
+static AsyncClient_event_t* _alloc_event(lwip_event_t event, AsyncClient* client, tcp_pcb* pcb) {
     // Validation check
     if (pcb && (client->pcb() != pcb)) {
         // Client structure is corrupt?
@@ -96,7 +96,7 @@ static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client
         return nullptr;
     }
 
-    lwip_event_packet_t * e = (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
+    AsyncClient_event_t * e = (AsyncClient_event_t *)malloc(sizeof(AsyncClient_event_t));
 
     if (!e) {
         // Allocation fail - abort client and give up
@@ -116,7 +116,7 @@ static lwip_event_packet_t* _alloc_event(lwip_event_t event, AsyncClient* client
     return e;
 }
 
-static void _free_event(lwip_event_packet_t* evpkt) {
+static void _free_event(AsyncClient_event_t* evpkt) {
     DEBUG_PRINTF("_FE: 0x%08x -> %d 0x%08x [0x%08x]\n",(intptr_t) evpkt, (int)evpkt->event, (intptr_t)evpkt->client, (intptr_t) evpkt->next);
     if ((evpkt->event == LWIP_TCP_RECV) && (evpkt->recv.pb != nullptr)) {
         // We must free the packet buffer
@@ -128,7 +128,7 @@ static void _free_event(lwip_event_packet_t* evpkt) {
 
 // Global variables
 static SemaphoreHandle_t _async_queue_mutex = nullptr;
-static lwip_event_packet_t* _async_queue_head = nullptr, *_async_queue_tail = nullptr;
+static AsyncClient_event_t* _async_queue_head = nullptr, *_async_queue_tail = nullptr;
 static TaskHandle_t _async_service_task_handle = NULL;
 
 namespace {
@@ -151,7 +151,7 @@ static inline bool _init_async_event_queue(){
     return true;
 }
 
-static inline bool _send_async_event(lwip_event_packet_t * e){
+static inline bool _send_async_event(AsyncClient_event_t * e){
     queue_mutex_guard guard;
     if (guard) {
         if (_async_queue_tail) {
@@ -171,7 +171,7 @@ static inline bool _send_async_event(lwip_event_packet_t * e){
     return (bool) guard;
 }
 
-static inline bool _prepend_async_event(lwip_event_packet_t * e) {
+static inline bool _prepend_async_event(AsyncClient_event_t * e) {
     queue_mutex_guard guard;
     if (guard) {
         if (_async_queue_head) {
@@ -191,9 +191,9 @@ static inline bool _prepend_async_event(lwip_event_packet_t * e) {
     return (bool) guard;
 }
 
-static inline lwip_event_packet_t* _get_async_event(){
+static inline AsyncClient_event_t* _get_async_event(){
     queue_mutex_guard guard;
-    lwip_event_packet_t *e = nullptr;
+    AsyncClient_event_t *e = nullptr;
     if (guard) {
         e = _async_queue_head;
         if (_async_queue_head) {
@@ -234,8 +234,8 @@ static bool _remove_events_for(AsyncClient* client){
 // Detail class for interacting with AsyncClient internals, but without exposing the API to other parts of the program
 class AsyncClient_detail {
     public:
-    static inline lwip_event_packet_t* invalidate_pcb(AsyncClient& client) { client._pcb = nullptr; return client._end_event; };
-    static void __attribute__((visibility("internal"))) handle_async_event(lwip_event_packet_t* event);
+    static inline AsyncClient_event_t* invalidate_pcb(AsyncClient& client) { client._pcb = nullptr; return client._end_event; };
+    static void __attribute__((visibility("internal"))) handle_async_event(AsyncClient_event_t* event);
 };
 
 static void _register_pcb(tcp_pcb* pcb, AsyncClient* client){
@@ -262,7 +262,7 @@ static void _teardown_pcb(tcp_pcb* pcb) {
     } 
 }
 
-void AsyncClient_detail::handle_async_event(lwip_event_packet_t * e){
+void AsyncClient_detail::handle_async_event(AsyncClient_event_t * e){
     // Special cases first
     if(e->event == LWIP_TCP_ERROR){
         DEBUG_PRINTF("-E: 0x%08x %d\n", e->client, e->error.err);
@@ -363,7 +363,7 @@ static bool _start_async_task(){
 static int8_t _tcp_connected(void * arg, tcp_pcb * pcb, int8_t err) {
     DEBUG_PRINTF("+C: 0x%08x\n", pcb);
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_CONNECTED, client, pcb);    
+    AsyncClient_event_t * e = _alloc_event(LWIP_TCP_CONNECTED, client, pcb);    
     if (e) {
         e->connected.err = err;
         _send_async_event(e);
@@ -375,7 +375,7 @@ static int8_t _tcp_connected(void * arg, tcp_pcb * pcb, int8_t err) {
 static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb) {
     DEBUG_PRINTF("+P: 0x%08x\n", pcb);
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_POLL, client, pcb);
+    AsyncClient_event_t * e = _alloc_event(LWIP_TCP_POLL, client, pcb);
     if (e != nullptr) {
         _send_async_event(e);
     } 
@@ -384,7 +384,7 @@ static int8_t _tcp_poll(void * arg, struct tcp_pcb * pcb) {
 
 static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, int8_t err) {
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_RECV, client, pcb);
+    AsyncClient_event_t * e = _alloc_event(LWIP_TCP_RECV, client, pcb);
     if (e != nullptr) {
         if(pb){
             DEBUG_PRINTF("+R: 0x%08x\n", pcb);
@@ -403,7 +403,7 @@ static int8_t _tcp_recv(void * arg, struct tcp_pcb * pcb, struct pbuf *pb, int8_
 static int8_t _tcp_sent(void * arg, struct tcp_pcb * pcb, uint16_t len) {
     DEBUG_PRINTF("+S: 0x%08x\n", pcb);
     AsyncClient* client = reinterpret_cast<AsyncClient*>(arg);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_SENT, client, pcb);
+    AsyncClient_event_t * e = _alloc_event(LWIP_TCP_SENT, client, pcb);
     if (e != nullptr) {
         e->sent.len = len;
         _send_async_event(e);
@@ -417,7 +417,7 @@ static void _tcp_error(void * arg, int8_t err) {
     assert(client);
     // The associated pcb is now invalid and will soon be deallocated
     // We call on the preallocated end event from the client object
-    lwip_event_packet_t * e = AsyncClient_detail::invalidate_pcb(*client);    
+    AsyncClient_event_t * e = AsyncClient_detail::invalidate_pcb(*client);    
     assert(e);
     e->error.err = err;
     _remove_events_for(client); // FUTURE: we could hold the lock the whole time
@@ -427,7 +427,7 @@ static void _tcp_error(void * arg, int8_t err) {
 static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * arg) {
     DEBUG_PRINTF("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
     auto client = reinterpret_cast<AsyncClient*>(arg);
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_DNS, client, client->pcb());
+    AsyncClient_event_t * e = _alloc_event(LWIP_TCP_DNS, client, client->pcb());
     if (e != nullptr) {
         e->dns.name = name;
         if (ipaddr) {
@@ -441,7 +441,7 @@ static void _tcp_dns_found(const char * name, struct ip_addr * ipaddr, void * ar
 
 // Runs on LWIP thread
 static int8_t _tcp_accept(AsyncServer* server, AsyncClient * client) {
-    lwip_event_packet_t * e = _alloc_event(LWIP_TCP_ACCEPT, client, client->pcb());
+    AsyncClient_event_t * e = _alloc_event(LWIP_TCP_ACCEPT, client, client->pcb());
     if (e) {
         e->accept.server = server;
         _send_async_event(e);
