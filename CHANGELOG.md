@@ -2,6 +2,12 @@
 
 Newest at top
 
+## 2024-11-15 - v1.3.1
+
+**Commit** [399d2cb0bcfc994e2c8d91070a8caa280e26193b](https://github.com/willmmiles/AsyncTCP/commit/399d2cb0bcfc994e2c8d91070a8caa280e26193b)
+
+* Fix outbound connections
+
 ## 2024-08-27 - v1.3.0
 
 **Commit** [faba3b5bf410ec503830f9a07cd694c0b6b98b2b](https://github.com/willmmiles/AsyncTCP/commit/faba3b5bf410ec503830f9a07cd694c0b6b98b2b)
