@@ -238,13 +238,17 @@ class AsyncClient_detail {
     static void __attribute__((visibility("internal"))) handle_async_event(AsyncClient_event_t* event);
 };
 
-static void _register_pcb(tcp_pcb* pcb, AsyncClient* client){
+static AsyncClient_event_t* _register_pcb(tcp_pcb* pcb, AsyncClient* client){
     // do client-specific setup
-    tcp_arg(pcb, client);
-    tcp_recv(pcb, &_tcp_recv);
-    tcp_sent(pcb, &_tcp_sent);
-    tcp_err(pcb, &_tcp_error);
-    tcp_poll(pcb, &_tcp_poll, 1);
+    auto end_event = _alloc_event(LWIP_TCP_ERROR, client, pcb);
+    if (end_event) {
+        tcp_arg(pcb, client);
+        tcp_recv(pcb, &_tcp_recv);
+        tcp_sent(pcb, &_tcp_sent);
+        tcp_err(pcb, &_tcp_error);
+        tcp_poll(pcb, &_tcp_poll, 1);
+    };
+    return end_event;
 }
 
 static void _teardown_pcb(tcp_pcb* pcb) {
@@ -270,7 +274,10 @@ void AsyncClient_detail::handle_async_event(AsyncClient_event_t * e){
         if (e->client)
             e->client->_error(e->error.err);
         return;  // do not free this event, it belongs to the client
-    } 
+    } else if (e->event == LWIP_TCP_DNS){   // client has no PCB allocated yet
+        DEBUG_PRINTF("-D: 0x%08x %s = %s", e->client, e->dns.name, ipaddr_ntoa(&e->dns.addr));
+        e->client->_dns_found(&e->dns.addr);
+    }
     // Now check for client pointer    
     else if(e->client->pcb() == NULL){
         // This can only happen if event processing is racing with closing or destruction in a third task.
@@ -303,9 +310,6 @@ void AsyncClient_detail::handle_async_event(AsyncClient_event_t * e){
     } else if(e->event == LWIP_TCP_ACCEPT){
         DEBUG_PRINTF("-A: 0x%08x 0x%08x\n", e->client, e->accept.server);
         e->accept.server->_accepted(e->client);
-    } else if(e->event == LWIP_TCP_DNS){
-        DEBUG_PRINTF("-D: 0x%08x %s = %s\n", e->client, e->dns.name, ipaddr_ntoa(&e->dns.addr));
-        e->client->_dns_found(&e->dns.addr);
     }
     _free_event(e);
 }
@@ -646,12 +650,11 @@ AsyncClient::AsyncClient(tcp_pcb* pcb)
 , _connect_port(0)
 {
     if(_pcb){
-        _end_event = _alloc_event(LWIP_TCP_ERROR, this, _pcb);
-        if (_end_event) {
-            _register_pcb(_pcb, this);
-            _rx_last_packet = millis();        
-        } else {
+        _end_event = _register_pcb(_pcb, this);
+        _rx_last_packet = millis();
+        if (!_end_event) {
             // Out of memory!!
+            log_e("Unable to allocate event");
             // Swallow this PCB, producing a null client object
             tcp_abort(_pcb);
             _pcb = nullptr;
@@ -738,12 +741,18 @@ bool AsyncClient::connect(IPAddress ip, uint16_t port){
     addr.type = IPADDR_TYPE_V4;
     addr.u_addr.ip4.addr = ip;
 
-    tcp_pcb* pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-    if (!pcb){
+    _pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!_pcb){
         log_e("pcb == NULL");
         return false;
     }
-    _register_pcb(pcb, this);
+    _end_event = _register_pcb(_pcb, this);
+    if (!_end_event) {
+        log_e("Unable to allocate event");
+        tcp_abort(_pcb);
+        _pcb = nullptr;
+        return false;
+    }
 
     tcp_api_call_t msg;
     msg.pcb_ptr = &_pcb;
