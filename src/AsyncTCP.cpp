@@ -119,7 +119,8 @@ public:
   static void __attribute__((visibility("internal"))) tcp_error(void *arg, int8_t err);
   static int8_t __attribute__((visibility("internal"))) tcp_poll(void *arg, struct tcp_pcb *pcb);
 
-  // Loop handler function
+  // Loop handler functions
+  static lwip_tcp_event_packet_t *__attribute__((visibility("internal"))) dequeue_async_event();
   static void __attribute__((visibility("internal"))) handle_async_event(lwip_tcp_event_packet_t *event);
 };
 
@@ -234,7 +235,7 @@ static inline bool _prepend_async_event(lwip_tcp_event_packet_t *e) {
   return (bool)guard;
 }
 
-static inline lwip_tcp_event_packet_t *_get_async_event() {
+lwip_tcp_event_packet_t *AsyncClient_detail::dequeue_async_event() {
   queue_mutex_guard guard;
   lwip_tcp_event_packet_t *e = nullptr;
   if (guard) {
@@ -246,6 +247,14 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
       _async_queue_tail = nullptr;
     }
     DEBUG_PRINTF("GAA: 0x%08x -> 0x%08x 0x%08x", (intptr_t)e, (intptr_t)_async_queue_head, (intptr_t)_async_queue_tail);
+    // Handle event coalescing
+    if (e) {
+      if ((e->event == LWIP_TCP_SENT) && (e->client->_sent_event == e)) {
+        e->client->_sent_event = nullptr;
+      } else if ((e->event == LWIP_TCP_RECV) && (e->client->_recv_event == e)) {
+        e->client->_recv_event = nullptr;
+      }
+    }
   }
   return e;
 }
@@ -360,7 +369,7 @@ static void _async_service_task(void *pvParameters) {
   }
 #endif
   for (;;) {
-    while (auto packet = _get_async_event()) {
+    while (auto packet = AsyncClient_detail::dequeue_async_event()) {
       AsyncClient_detail::handle_async_event(packet);
 #if CONFIG_ASYNC_TCP_USE_WDT
       esp_task_wdt_reset();
@@ -474,11 +483,9 @@ int8_t AsyncClient_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf 
     // Attempt to coaelesce this event - list walk version
     queue_mutex_guard guard;
     if (guard) {
-      for (auto event = _async_queue_head; event != nullptr; event = event->next) {
-        if ((event->client == client) && (event->event == LWIP_TCP_RECV)) {
-          pbuf_cat(event->recv.pb, pb);
-          return ERR_OK;
-        }
+      if (client->_recv_event) {
+        pbuf_cat(client->_recv_event->recv.pb, pb);
+        return ERR_OK;
       }
     }
   }
@@ -490,6 +497,7 @@ int8_t AsyncClient_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf 
 
   if (pb) {
     DEBUG_PRINTF("+R: 0x%08x", pcb);
+    client->_recv_event = e;
     e->recv.pb = pb;
     e->recv.err = err;
   } else {
@@ -510,12 +518,10 @@ int8_t AsyncClient_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len
     // Attempt to coaelesce this event - list walk version
     queue_mutex_guard guard;
     if (guard) {
-      for (auto event = _async_queue_head; event != nullptr; event = event->next) {
-        if ((event->client == client) && (event->event == LWIP_TCP_SENT)) {
-          // TODO - check for overrun
-          event->sent.len += len;
-          return ERR_OK;
-        }
+      if (client->_sent_event) {
+        // TODO - check for overrun
+        client->_sent_event->sent.len += len;
+        return ERR_OK;
       }
     }
   }
@@ -525,6 +531,7 @@ int8_t AsyncClient_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len
     return ERR_MEM;
   }
   e->sent.len = len;
+  client->_sent_event = e;
   _send_async_event(e);
   return ERR_OK;
 }
@@ -729,9 +736,9 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
  */
 
 AsyncClient::AsyncClient(tcp_pcb *pcb)
-  : _pcb(pcb), _end_event(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0),
-    _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _ack_pcb(true), _tx_last_packet(0),
-    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+  : _pcb(pcb), _end_event(nullptr), _recv_event(nullptr), _sent_event(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0),
+    _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0),
+    _ack_pcb(true), _tx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
   if (_pcb) {
     _end_event = _register_pcb(_pcb, this);
     _rx_last_packet = millis();
