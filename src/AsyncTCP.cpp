@@ -680,7 +680,7 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
   : _pcb(pcb), _end_event(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0),
     _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _ack_pcb(true), _tx_last_packet(0),
     _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0)
-#ifdef CONFIG_ASYNC_TCP_CLIENT_LIST
+#if (CONFIG_ASYNC_TCP_HAS_INTRUSIVE_LIST)
     ,
     prev(NULL), next(NULL)
 #endif
@@ -737,7 +737,7 @@ bool AsyncClient::operator==(const AsyncClient &other) {
   return _pcb == other._pcb;
 }
 
-#ifdef CONFIG_ASYNC_TCP_CLIENT_LIST
+#if (CONFIG_ASYNC_TCP_HAS_INTRUSIVE_LIST)
 AsyncClient &AsyncClient::operator+=(const AsyncClient &other) {
   if (next == NULL) {
     next = (AsyncClient *)(&other);

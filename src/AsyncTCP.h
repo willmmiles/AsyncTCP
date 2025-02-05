@@ -51,8 +51,8 @@ extern "C" {
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME 5000
 #endif
 
-#ifndef CONFIG_ASYNCTCP_HAS_INTRUSIVE_LIST
-#define CONFIG_ASYNCTCP_HAS_INTRUSIVE_LIST 1
+#ifndef CONFIG_ASYNC_TCP_HAS_INTRUSIVE_LIST
+#define CONFIG_ASYNC_TCP_HAS_INTRUSIVE_LIST 1
 #endif
 
 class AsyncClient;
@@ -277,7 +277,7 @@ protected:
   void _dns_found(struct ip_addr *ipaddr);
   int8_t _recved(size_t len);
 
-#ifdef CONFIG_ASYNC_TCP_CLIENT_LIST
+#if (CONFIG_ASYNC_TCP_HAS_INTRUSIVE_LIST)
 public:
   AsyncClient *prev;
   AsyncClient *next;
