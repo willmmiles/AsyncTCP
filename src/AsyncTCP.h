@@ -80,6 +80,14 @@ public:
   AsyncClient(tcp_pcb *pcb = 0);
   ~AsyncClient();
 
+  // Noncopyable
+  AsyncClient(const AsyncClient &) = delete;
+  AsyncClient &operator=(const AsyncClient &) = delete;
+
+  // Nonmovable
+  AsyncClient(AsyncClient &&) = delete;
+  AsyncClient &operator=(AsyncClient &&) = delete;
+
   inline bool operator==(const AsyncClient &other) {
     return _pcb == other._pcb;
   }
@@ -289,6 +297,15 @@ public:
 #endif
   AsyncServer(uint16_t port);
   ~AsyncServer();
+
+  // Noncopyable
+  AsyncServer(const AsyncServer &) = delete;
+  AsyncServer &operator=(const AsyncServer &) = delete;
+
+  // Nonmovable
+  AsyncServer(AsyncServer &&) = delete;
+  AsyncServer &operator=(AsyncServer &&) = delete;
+
   void onClient(AcConnectHandler cb, void *arg);
   void begin();
   void end();
