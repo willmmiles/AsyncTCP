@@ -73,8 +73,10 @@ public:
   AsyncClient(tcp_pcb *pcb = 0);
   ~AsyncClient();
 
-  bool operator==(const AsyncClient &other);
-  bool operator!=(const AsyncClient &other) {
+  inline bool operator==(const AsyncClient &other) {
+    return _pcb == other._pcb;
+  }
+  inline bool operator!=(const AsyncClient &other) {
     return !(*this == other);
   }
 
