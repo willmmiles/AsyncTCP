@@ -106,11 +106,22 @@ struct lwip_tcp_event_packet_t {
   };
 };
 
-// Forward declarations for TCP event callbacks
-static int8_t _tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err);
-static int8_t _tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len);
-static void _tcp_error(void *arg, int8_t err);
-static int8_t _tcp_poll(void *arg, struct tcp_pcb *pcb);
+// Detail class for interacting with AsyncClient internals, but without exposing the API to other parts of the program
+class AsyncClient_detail {
+public:
+  static inline lwip_tcp_event_packet_t *invalidate_pcb(AsyncClient &client) {
+    client._pcb = nullptr;
+    return client._end_event;
+  };
+  // TCP event callbacks
+  static int8_t __attribute__((visibility("internal"))) tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err);
+  static int8_t __attribute__((visibility("internal"))) tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len);
+  static void __attribute__((visibility("internal"))) tcp_error(void *arg, int8_t err);
+  static int8_t __attribute__((visibility("internal"))) tcp_poll(void *arg, struct tcp_pcb *pcb);
+
+  // Loop handler function
+  static void __attribute__((visibility("internal"))) handle_async_event(lwip_tcp_event_packet_t *event);
+};
 
 // helper function
 static lwip_tcp_event_packet_t *_alloc_event(lwip_tcp_event_t event, AsyncClient *client, tcp_pcb *pcb) {
@@ -119,7 +130,7 @@ static lwip_tcp_event_packet_t *_alloc_event(lwip_tcp_event_t event, AsyncClient
     // Client structure is corrupt?
     log_e("Client mismatch allocating event for 0x%08x 0x%08x vs 0x%08x", (intptr_t)client, (intptr_t)pcb, client->pcb());
     tcp_abort(pcb);
-    _tcp_error(client, ERR_ARG);
+    AsyncClient_detail::tcp_error(client, ERR_ARG);
     return nullptr;
   }
 
@@ -131,7 +142,7 @@ static lwip_tcp_event_packet_t *_alloc_event(lwip_tcp_event_t event, AsyncClient
     if (pcb) {
       tcp_abort(pcb);
     }
-    _tcp_error(client, ERR_MEM);
+    AsyncClient_detail::tcp_error(client, ERR_MEM);
     return nullptr;
   }
 
@@ -266,25 +277,15 @@ static bool _remove_events_for(AsyncClient *client) {
   return (bool)guard;
 };
 
-// Detail class for interacting with AsyncClient internals, but without exposing the API to other parts of the program
-class AsyncClient_detail {
-public:
-  static inline lwip_tcp_event_packet_t *invalidate_pcb(AsyncClient &client) {
-    client._pcb = nullptr;
-    return client._end_event;
-  };
-  static void __attribute__((visibility("internal"))) handle_async_event(lwip_tcp_event_packet_t *event);
-};
-
 static lwip_tcp_event_packet_t *_register_pcb(tcp_pcb *pcb, AsyncClient *client) {
   // do client-specific setup
   auto end_event = _alloc_event(LWIP_TCP_ERROR, client, pcb);
   if (end_event) {
     tcp_arg(pcb, client);
-    tcp_recv(pcb, &_tcp_recv);
-    tcp_sent(pcb, &_tcp_sent);
-    tcp_err(pcb, &_tcp_error);
-    tcp_poll(pcb, &_tcp_poll, 1);
+    tcp_recv(pcb, &AsyncClient_detail::tcp_recv);
+    tcp_sent(pcb, &AsyncClient_detail::tcp_sent);
+    tcp_err(pcb, &AsyncClient_detail::tcp_error);
+    tcp_poll(pcb, &AsyncClient_detail::tcp_poll, 1);
   };
   return end_event;
 }
@@ -435,7 +436,7 @@ static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   return ERR_OK;
 }
 
-static int8_t _tcp_poll(void *arg, struct tcp_pcb *pcb) {
+int8_t AsyncClient_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
   DEBUG_PRINTF("+P: 0x%08x", pcb);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
 
@@ -466,7 +467,7 @@ static int8_t _tcp_poll(void *arg, struct tcp_pcb *pcb) {
   return ERR_OK;
 }
 
-static int8_t _tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
+int8_t AsyncClient_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
 
   if (pb && (err == ERR_OK)) {
@@ -501,7 +502,7 @@ static int8_t _tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t 
   return ERR_OK;
 }
 
-static int8_t _tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
+int8_t AsyncClient_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   DEBUG_PRINTF("+S: 0x%08x", pcb);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
 
@@ -528,7 +529,7 @@ static int8_t _tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   return ERR_OK;
 }
 
-static void _tcp_error(void *arg, int8_t err) {
+void AsyncClient_detail::tcp_error(void *arg, int8_t err) {
   DEBUG_PRINTF("+E: 0x%08x", arg);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
   assert(client);
