@@ -438,6 +438,26 @@ static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
 static int8_t _tcp_poll(void *arg, struct tcp_pcb *pcb) {
   DEBUG_PRINTF("+P: 0x%08x", pcb);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
+
+  // Attempt to coaelesce this event - list walk version
+  // Permit exactly two such events in the queue per client
+#if CONFIG_ASYNC_TCP_MAX_CLIENT_POLLS > 0
+  {  // Queue guard scope
+    queue_mutex_guard guard;
+    if (guard) {
+      auto polls_found = 0U;
+      for (auto event = _async_queue_head; event != nullptr; event = event->next) {
+        if ((event->client == client) && (event->event == LWIP_TCP_POLL)) {
+          ++polls_found;
+          if (++polls_found == CONFIG_ASYNC_TCP_MAX_CLIENT_POLLS) {
+            return ERR_OK;  // enough polls already in the queue!
+          }
+        }
+      }
+    }
+  }
+#endif
+
   lwip_tcp_event_packet_t *e = _alloc_event(LWIP_TCP_POLL, client, pcb);
   if (e == nullptr) {
     return ERR_MEM;
