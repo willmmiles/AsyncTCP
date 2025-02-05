@@ -468,6 +468,20 @@ static int8_t _tcp_poll(void *arg, struct tcp_pcb *pcb) {
 
 static int8_t _tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
+
+  if (pb && (err == ERR_OK)) {
+    // Attempt to coaelesce this event - list walk version
+    queue_mutex_guard guard;
+    if (guard) {
+      for (auto event = _async_queue_head; event != nullptr; event = event->next) {
+        if ((event->client == client) && (event->event == LWIP_TCP_RECV)) {
+          pbuf_cat(event->recv.pb, pb);
+          return ERR_OK;
+        }
+      }
+    }
+  }
+
   lwip_tcp_event_packet_t *e = _alloc_event(LWIP_TCP_RECV, client, pcb);
   if (e == nullptr) {
     return ERR_MEM;
@@ -490,6 +504,21 @@ static int8_t _tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t 
 static int8_t _tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   DEBUG_PRINTF("+S: 0x%08x", pcb);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
+
+  {
+    // Attempt to coaelesce this event - list walk version
+    queue_mutex_guard guard;
+    if (guard) {
+      for (auto event = _async_queue_head; event != nullptr; event = event->next) {
+        if ((event->client == client) && (event->event == LWIP_TCP_SENT)) {
+          // TODO - check for overrun
+          event->sent.len += len;
+          return ERR_OK;
+        }
+      }
+    }
+  }
+
   lwip_tcp_event_packet_t *e = _alloc_event(LWIP_TCP_SENT, client, pcb);
   if (e == nullptr) {
     return ERR_MEM;
