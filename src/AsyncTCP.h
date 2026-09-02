@@ -305,7 +305,6 @@ protected:
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 };
 
