@@ -108,7 +108,8 @@ struct tcp_core_guard {
 struct AsyncClientCallbackContext {
   AsyncClientCallbackContext *next = nullptr;
   bool client_is_valid = true;
-  bool ack_pcb = true;
+  bool ack_later = false;
+  u16_t ack_len = 0;  // lwip's size_t
 };
 
 /*
@@ -946,7 +947,16 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
 
 void AsyncClient::close() {
   if (_pcb) {
-    _tcp_recved(&_pcb, _rx_ack_len);
+    // If we're in an onData callback, add the final packet size to the ack count
+    // before closing the connection.
+    size_t pending = _rx_ack_len;
+    _rx_ack_len = 0;
+    for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+      pending += ctx->ack_len;
+    }
+    if (pending) {
+      _tcp_recved(&_pcb, pending);
+    }
   }
   _close();
 }
@@ -1021,7 +1031,7 @@ void AsyncClient::ackLater() {
   // is to call abort() during an onData or onPacket callback.  Calling ackLater() in that context wouldn't do
   // anything useful.  Still we err on the side of being technically correct.
   for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
-    ctx->ack_pcb = false;
+    ctx->ack_later = true;
   }
 }
 
@@ -1078,6 +1088,8 @@ void AsyncClient::_error(int8_t err) {
   if (!ctx.client_is_valid) {
     return;
   }
+  // Since we no longer need it, release the callback context before calling discard
+  // so we don't have to check client_is_valid again before clearing it.
   _cb_ctx = ctx.next;
   if (_discard_cb) {
     async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
@@ -1090,11 +1102,11 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
   _cb_ctx = &ctx;
   while (pb != NULL) {
     _rx_last_packet = millis();
-    // we should not ack before we assimilate the data
-    ctx.ack_pcb = true;
+    // Grab the next pbuf.  We hand it to the user callback, then ack it if needed.
     pbuf *b = pb;
     pb = pb->next;
-    b->next = NULL;
+    b->next = NULL;    
+    ctx.ack_later = false;
     if (_pb_cb) {
       async_tcp_log_elapsed("onPacket", _pb_cb(_pb_cb_arg, this, b));
       // Break if object was destructed or pcb closed
@@ -1102,20 +1114,21 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
         break;
       }
     } else {
+      ctx.ack_len = b->len;
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, b->payload, b->len));
       }
-      u16_t blen = b->len;
       pbuf_free(b);
-      // Break if object was destructed or pcb closed
+      // Break if object was destructed or pcb closed (and thus we do not need to ack the data)
       if ((!ctx.client_is_valid) || (!_pcb)) {
         break;
       }
-      if (!ctx.ack_pcb) {
-        _rx_ack_len += blen;
+      if (ctx.ack_later == false) {
+        _tcp_recved(&_pcb, ctx.ack_len);
       } else {
-        _tcp_recved(&_pcb, blen);
+        _rx_ack_len += ctx.ack_len;
       }
+      ctx.ack_len = 0;
     }
   }
   if (pb) {
