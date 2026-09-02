@@ -1105,7 +1105,7 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
     // Grab the next pbuf.  We hand it to the user callback, then ack it if needed.
     pbuf *b = pb;
     pb = pb->next;
-    b->next = NULL;    
+    b->next = NULL;
     ctx.ack_later = false;
     if (_pb_cb) {
       async_tcp_log_elapsed("onPacket", _pb_cb(_pb_cb_arg, this, b));
