@@ -1057,13 +1057,14 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
   return ERR_OK;
 }
 
-// In LwIP Thread
-// Disable the "dangling pointer" warning for these calls.
+// Disable the "dangling pointer" warning for these calls with newer GCCs
 // We store a pointer to a stack local AsyncClientCallbackContext in the AsyncClient object over the context of the function
 // call to track if the object was destroyed.  If so, we do not reset the pointer, which GCC identifies as a possible
 // dangling reference case.  It is not - the reference was destroyed along with the AsyncClient object.
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 12)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 
 void AsyncClient::_error(int8_t err) {
   AsyncClientCallbackContext ctx;
@@ -1126,7 +1127,9 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
   return ERR_OK;
 }
 
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 12)
 #pragma GCC diagnostic pop
+#endif
 
 int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
   close();
