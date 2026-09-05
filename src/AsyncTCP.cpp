@@ -1294,6 +1294,9 @@ bool AsyncClient::getNoDelay() {
 }
 
 void AsyncClient::setKeepAlive(uint32_t ms, uint8_t cnt) {
+  if (!_pcb) {
+    return;
+  }
   if (ms != 0) {
     _pcb->so_options |= SOF_KEEPALIVE;  // Turn on TCP Keepalive for the given pcb
     // Set the time between keepalive messages in milli-seconds
