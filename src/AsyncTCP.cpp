@@ -1631,11 +1631,19 @@ void AsyncServer::begin() {
   }
 
   static uint8_t backlog = 5;
-  _pcb = _tcp_listen_with_backlog(_pcb, backlog);
-  if (!_pcb) {
+  tcp_pcb *listen_pcb = _tcp_listen_with_backlog(_pcb, backlog);
+  if (!listen_pcb) {
+    // LwIP frees the original pcb only on success; ours is still bound, and holds
+    // the port reserved until we release it.
     async_tcp_log_e("listen_pcb == NULL");
+    tcp_core_guard tcg;
+    if (tcp_close(_pcb) != ERR_OK) {
+      tcp_abort(_pcb);
+    }
+    _pcb = nullptr;
     return;
   }
+  _pcb = listen_pcb;
   tcp_core_guard tcg;
   tcp_arg(_pcb, (void *)this);
   tcp_accept(_pcb, &AsyncTCP_detail::tcp_accept);
