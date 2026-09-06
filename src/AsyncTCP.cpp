@@ -172,6 +172,8 @@ class AsyncTCP_detail {
 public:
   // Helper functions
   static void __attribute__((visibility("internal"))) handle_async_event(lwip_tcp_event_packet_t *event);
+  static size_t __attribute__((visibility("internal"))) remove_events_for_client(AsyncClient *client, lwip_tcp_event_packet_t *terminal = nullptr);
+  static bool __attribute__((visibility("internal"))) release_pending_event(AsyncClient *client);
 
   // LwIP TCP event callbacks that (will) require privileged access
   static int8_t __attribute__((visibility("internal"))) tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err);
@@ -280,15 +282,44 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
   }
 }
 
-static size_t _remove_events_for_client(AsyncClient *client) {
+// Detach the client from its pending event so nothing will dispatch to it.  Reports
+// whether there was one.
+bool AsyncTCP_detail::release_pending_event(AsyncClient *client) {
+  queue_mutex_guard guard;
+  if (!client->_pending_event) {
+    return false;
+  }
+  client->_pending_event->client = nullptr;
+  client->_pending_event = nullptr;
+  return true;
+}
+
+size_t AsyncTCP_detail::remove_events_for_client(AsyncClient *client, lwip_tcp_event_packet_t *terminal) {
+  // We perform several stages under the queue mutex as a single atomic pass.
   lwip_tcp_event_packet_t *removed_event_chain;
   {
     queue_mutex_guard guard;
+    // First, unlink all events that belong to this client from the async queue.
     removed_event_chain = _async_queue.remove_if([=](lwip_tcp_event_packet_t &pkt) {
       return pkt.client == client;
     });
-  }
+    // If one of those events was the client's pending event, clear it.
+    for (auto *p = removed_event_chain; p != nullptr; p = p->next) {
+      if (client->_pending_event == p) {
+        client->_pending_event = nullptr;
+        break;
+      }
+    }
+    // Finally, if a terminal event was supplied, add it to the queue as the client's new pending event.
+    // We also clear the _pcb pointer to indicate that the AsyncClient is invalidated.
+    if (terminal) {
+      client->_pcb = nullptr;
+      client->_pending_event = terminal;
+      _send_async_event(terminal);
+    }
+  }  // end of queue mutex scope
 
+  // Now that we have released the queue mutex, we can free the removed events.
   size_t count = 0;
   while (removed_event_chain) {
     ++count;
@@ -341,6 +372,14 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
   } else if (e->event == LWIP_TCP_ERROR) {
     // ets_printf("-E: 0x%08x %d\n", e->client, e->error.err);
     e->client->_error(e->error.err);
+    // If the client is still holding the event, release it now.  ~AsyncClient() nulls
+    // e->client, so this also covers the callback having destroyed the client.
+    {
+      queue_mutex_guard guard;
+      if (e->client && (e->client->_pending_event == e)) {
+        e->client->_pending_event = nullptr;
+      }
+    }
   } else if (e->event == LWIP_TCP_CONNECTED) {
     // ets_printf("C: 0x%08x 0x%08x %d\n", e->client, e->connected.pcb, e->connected.err);
     e->client->_connected(e->connected.pcb, e->connected.err);
@@ -445,7 +484,7 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClient *client) {
   tcp_err(pcb, NULL);
   tcp_poll(pcb, NULL, 0);
   if (client) {
-    _remove_events_for_client(client);
+    AsyncTCP_detail::remove_events_for_client(client);
   }
 }
 
@@ -532,22 +571,28 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
 void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   // ets_printf("+E: 0x%08x\n", arg);
   AsyncClient *client = reinterpret_cast<AsyncClient *>(arg);
-  if (client && client->_pcb) {
-    // The pcb has already been freed by LwIP; do not attempt to clear the callbacks!
-    _remove_events_for_client(client);
-    client->_pcb = nullptr;
+  // _pcb is only ever cleared from this thread, so this is a stable read
+  if ((client == nullptr) || (client->_pcb == nullptr)) {
+    // Not the client that owns this pcb: nothing to report, and an event queued here
+    // would be referenced by nobody, leaving it impossible to detach from.
+    async_tcp_log_e("error callback for a client with no pcb");
+    return;
   }
 
+  // The pcb has already been freed by LwIP; do not attempt to clear the callbacks!
   // enqueue event to be processed in the async task for the user callback
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ERROR, client};
   if (!e) {
+    // The pcb is gone either way, so we must still forget it - which leaves the client
+    // orphaned with nothing to detach from.  Pre-allocating the event would close this.
     async_tcp_log_e("Failed to allocate event packet");
+    remove_events_for_client(client);
+    queue_mutex_guard guard;
+    client->_pcb = nullptr;
     return;
   }
   e->error.err = err;
-
-  queue_mutex_guard guard;
-  _send_async_event(e);
+  remove_events_for_client(client, e);
 }
 
 static void _tcp_dns_found(const char *name, ip_addr_t *ipaddr, void *arg) {
@@ -686,7 +731,7 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
     *msg->pcb = nullptr;  // PCB is now the property of LwIP
   } else {
     // Ensure there is not an error event queued for this client
-    if (_remove_events_for_client(msg->close)) {
+    if (AsyncTCP_detail::remove_events_for_client(msg->close)) {
       msg->err = ERR_OK;  // dispose needs to be run
     }
   }
@@ -715,7 +760,7 @@ static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
     msg->err = ERR_ABRT;
   } else {
     // Ensure there is not an error event queued for this client
-    msg->err = _remove_events_for_client(msg->close) ? ERR_OK : ERR_CONN;
+    msg->err = AsyncTCP_detail::remove_events_for_client(msg->close) ? ERR_OK : ERR_CONN;
   }
   return msg->err;
 }
@@ -821,7 +866,8 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
 AsyncClient::AsyncClient(tcp_pcb *pcb)
   : _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0),
     _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _cb_ctx(nullptr),
-    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0),
+    _pending_event(nullptr) {
   if (pcb) {
     _adopt(pcb);
   }
@@ -829,8 +875,9 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
 
 AsyncClient::~AsyncClient() {
   if (_pcb) {
-    close();
+    close();  // purges the queue
   }
+  AsyncTCP_detail::release_pending_event(this);  // interacts with queue
   // Inform all callbacks in the stack that this object is now destructed.
   for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
     ctx->client_is_valid = false;

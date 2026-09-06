@@ -73,6 +73,7 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 struct tcp_pcb;
 class AsyncTCP_detail;
 struct AsyncClientCallbackContext;
+struct lwip_tcp_event_packet_t;
 
 class AsyncClient {
 public:
@@ -298,6 +299,9 @@ protected:
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
   uint16_t _connect_port;
+  // The event that will resolve this client's pending business, if any.  Set only while
+  // _pcb is null; cleared when the event is consumed, or detached from on destruction.
+  lwip_tcp_event_packet_t *_pending_event;
 
   void _adopt(tcp_pcb *pcb);
   int8_t _connected(tcp_pcb *pcb, int8_t err);
