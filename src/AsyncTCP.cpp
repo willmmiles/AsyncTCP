@@ -159,8 +159,9 @@ struct lwip_tcp_event_packet_t {
       AsyncServer *server;
     } accept;
     struct {
-      const char *name;
       ip_addr_t addr;
+      uint16_t port;
+      bool resolved;
     } dns;
   };
 
@@ -181,6 +182,7 @@ public:
   static void __attribute__((visibility("internal"))) tcp_error(void *arg, int8_t err);
   static int8_t __attribute__((visibility("internal"))) tcp_poll(void *arg, struct tcp_pcb *pcb);
   static int8_t __attribute__((visibility("internal"))) tcp_accept(void *arg, tcp_pcb *pcb, int8_t err);
+  static void __attribute__((visibility("internal"))) tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg);
 };
 
 // Guard class for the global queue
@@ -304,6 +306,7 @@ size_t AsyncTCP_detail::remove_events_for_client(AsyncClient *client, lwip_tcp_e
       return pkt.client == client;
     });
     // If one of those events was the client's pending event, clear it.
+    // A lookup still in flight is held by LwIP, not by the queue, so it is not in here.
     for (auto *p = removed_event_chain; p != nullptr; p = p->next) {
       if (client->_pending_event == p) {
         client->_pending_event = nullptr;
@@ -387,8 +390,8 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
     // ets_printf("A: 0x%08x 0x%08x\n", e->client, e->accept.client);
     e->accept.server->_accepted(e->client);
   } else if (e->event == LWIP_TCP_DNS) {
-    // ets_printf("D: 0x%08x %s = %s\n", e->client, e->dns.name, ipaddr_ntoa(&e->dns.addr));
-    e->client->_dns_found(&e->dns.addr);
+    // ets_printf("D: 0x%08x = %s\n", e->client, ipaddr_ntoa(&e->dns.addr));
+    e->client->_dns_found(e->dns.resolved, &e->dns.addr, e->dns.port);
   }
   _free_event(e);
 }
@@ -595,24 +598,28 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   remove_events_for_client(client, e);
 }
 
-static void _tcp_dns_found(const char *name, ip_addr_t *ipaddr, void *arg) {
+// LwIP owns the event we allocated for this lookup until we get here, and always calls
+// us exactly once - including on timeout - so it is never stranded.  'name' points into
+// LwIP's DNS table, which the next lookup recycles; don't keep it.
+void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg) {
   // ets_printf("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
-  auto client = reinterpret_cast<AsyncClient *>(arg);
+  (void)name;
+  auto e = reinterpret_cast<lwip_tcp_event_packet_t *>(arg);
 
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client};
-  if (!e) {
-    async_tcp_log_e("Failed to allocate event packet");
+  queue_mutex_guard guard;
+  if (!e->client) {
+    // Client detached while we were resolving; the event is ours to drop
+    _free_event(e);
     return;
   }
 
-  e->dns.name = name;
+  e->dns.resolved = (ipaddr != nullptr);
   if (ipaddr) {
     memcpy(&e->dns.addr, ipaddr, sizeof(ip_addr_t));
   } else {
     memset(&e->dns.addr, 0, sizeof(e->dns.addr));
   }
-
-  queue_mutex_guard guard;
+  // Stays in _pending_event: it is queued but not yet consumed
   _send_async_event(e);
 }
 
@@ -866,7 +873,7 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
 AsyncClient::AsyncClient(tcp_pcb *pcb)
   : _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0),
     _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _cb_ctx(nullptr),
-    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0),
+    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME),
     _pending_event(nullptr) {
   if (pcb) {
     _adopt(pcb);
@@ -945,6 +952,10 @@ bool AsyncClient::connect(ip_addr_t addr, uint16_t port) {
     async_tcp_log_d("already connected, state %d", _pcb->state);
     return false;
   }
+  if (_resolving()) {
+    async_tcp_log_d("name resolution in progress");
+    return false;
+  }
   if (!_start_async_task()) {
     async_tcp_log_e("failed to start task");
     return false;
@@ -1006,16 +1017,44 @@ bool AsyncClient::connect(const IPv6Address &ip, uint16_t port) {
 bool AsyncClient::connect(const char *host, uint16_t port) {
   ip_addr_t addr;
 
+  if (_pcb) {
+    async_tcp_log_d("already connected, state %d", _pcb->state);
+    return false;
+  }
+  if (_resolving()) {
+    // LwIP coalesces a duplicate lookup onto the outstanding one anyway, so a retry
+    // never bought anything.  Let the attempt already in flight run to completion.
+    async_tcp_log_d("name resolution already in progress");
+    return true;
+  }
   if (!_start_async_task()) {
     async_tcp_log_e("failed to start task");
     return false;
   }
 
+  // Allocate the event up front and hand it to LwIP as the lookup's argument: it holds
+  // our back-reference, so destroying this client cannot strand a pointer in the DNS
+  // table.  LwIP calls back if and only if it returns ERR_INPROGRESS.
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, this};
+  if (!e) {
+    async_tcp_log_e("Failed to allocate event packet");
+    return false;
+  }
+  e->dns.port = port;
+  _pending_event = e;
+
   err_t err;
   {
     tcp_core_guard tcg;
-    err = dns_gethostbyname(host, &addr, (dns_found_callback)&_tcp_dns_found, this);
+    err = dns_gethostbyname(host, &addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, e);
   }
+
+  if (err == ERR_INPROGRESS) {
+    return true;  // the event now belongs to LwIP
+  }
+
+  _pending_event = nullptr;
+  _free_event(e);
 
   if (err == ERR_OK) {
 #if ESP_IDF_VERSION_MAJOR < 5
@@ -1030,15 +1069,16 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
 #else
     return connect(addr, port);
 #endif
-  } else if (err == ERR_INPROGRESS) {
-    _connect_port = port;
-    return true;
   }
   async_tcp_log_d("error: %d", err);
   return false;
 }
 
 void AsyncClient::close() {
+  if (_resolving()) {
+    // Cancel the lookup.  There is no pcb, so no dispose path is at risk here.
+    AsyncTCP_detail::release_pending_event(this);
+  }
   // ets_printf("X: 0x%08x\n", (uint32_t)this);
   if (_pcb) {
     // Ack anything withheld by ackLater(), plus the packet being handled by an
@@ -1061,6 +1101,10 @@ void AsyncClient::close() {
 }
 
 int8_t AsyncClient::abort() {
+  if (_resolving()) {
+    // Cancel the lookup.  There is no pcb, so no dispose path is at risk here.
+    AsyncTCP_detail::release_pending_event(this);
+  }
   int8_t err = _tcp_abort(&_pcb, this);
   // _pcb is now NULL
   // LwIP invokes the error callback when abort is issued; preserve this semantic.
@@ -1137,6 +1181,11 @@ void AsyncClient::ackLater() {
 /*
  * Main Private Methods
  * */
+
+// True while a hostname lookup is outstanding.
+bool AsyncClient::_resolving() const {
+  return _pending_event && (_pending_event->event == LWIP_TCP_DNS);
+}
 
 // Adopt a pcb and reset all per-connection state.  Callers must already be
 // serialized against the LwIP core (accept callback, or tcp_core_guard).
@@ -1298,12 +1347,16 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   return ERR_OK;
 }
 
-void AsyncClient::_dns_found(ip_addr_t *ipaddr) {
-  if (ipaddr) {
-    connect(*ipaddr, _connect_port);
-  } else {
-    _error(-55);
+void AsyncClient::_dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port) {
+  // Drop our handle before connect(), which refuses to start while a lookup is still
+  // outstanding.  Unlike an error event, this cannot wait until after the dispatch.
+  AsyncTCP_detail::release_pending_event(this);
+  if (resolved && connect(*ipaddr, port)) {
+    return;
   }
+  // connect() reported success to the caller, so this attempt owes them exactly one
+  // of onConnect or onError.
+  _error(resolved ? ERR_CONN : -55);
 }
 
 /*
@@ -1548,6 +1601,9 @@ bool AsyncClient::connected() const {
 }
 
 bool AsyncClient::connecting() const {
+  if (_resolving()) {
+    return true;
+  }
   if (!_pcb) {
     return false;
   }
@@ -1562,6 +1618,9 @@ bool AsyncClient::disconnecting() const {
 }
 
 bool AsyncClient::disconnected() const {
+  if (_resolving()) {
+    return false;
+  }
   if (!_pcb) {
     return true;
   }

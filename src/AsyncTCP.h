@@ -298,18 +298,18 @@ protected:
   uint32_t _rx_timeout;
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
-  uint16_t _connect_port;
   // The event that will resolve this client's pending business, if any.  Set only while
   // _pcb is null; cleared when the event is consumed, or detached from on destruction.
   lwip_tcp_event_packet_t *_pending_event;
 
   void _adopt(tcp_pcb *pcb);
+  bool _resolving() const;
   int8_t _connected(tcp_pcb *pcb, int8_t err);
   void _error(int8_t err);
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  void _dns_found(ip_addr_t *ipaddr);
+  void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
 };
 
 class AsyncServer {
