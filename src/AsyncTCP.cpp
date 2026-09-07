@@ -720,10 +720,10 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
   // Unlike the other calls, this is not a direct wrapper of the LwIP function;
   // we perform the AsyncClient teardown interlocked safely with the LwIP task.
 
-  // As a postcondition, the queue must not have any events referencing
-  // the AsyncClient in api_call_msg->close.  This is because it is possible for
-  // an error event to have been queued, clearing the pcb*, but after the async
-  // thread has committed to closing/destructing the AsyncClient object.
+  // As a postcondition, nothing reachable from the queue may still refer to the
+  // AsyncClient in api_call_msg->close.  This is because it is possible for an error
+  // event to have been queued, clearing the pcb*, but after the async thread has
+  // committed to closing/destructing the AsyncClient object.
 
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   msg->err = ERR_CONN;
@@ -736,11 +736,11 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
     }
     msg->err = ERR_OK;
     *msg->pcb = nullptr;  // PCB is now the property of LwIP
-  } else {
-    // Ensure there is not an error event queued for this client
-    if (AsyncTCP_detail::remove_events_for_client(msg->close)) {
-      msg->err = ERR_OK;  // dispose needs to be run
-    }
+  } else if (AsyncTCP_detail::release_pending_event(msg->close)) {
+    // The pcb went away without the client being told; deliver the disconnect in the
+    // pending event's place.  Nothing else can be queued for a client with no pcb -
+    // every path that drops one purges on the way out.
+    msg->err = ERR_OK;  // dispose needs to be run
   }
   return msg->err;
 }
@@ -754,11 +754,11 @@ static esp_err_t _tcp_close(tcp_pcb **pcb, AsyncClient *client) {
 }
 
 static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
-  // Like close(), we must ensure that the queue is cleared of any events referencing the AsyncClient.
+  // Like close(), nothing reachable from the queue may still refer to the AsyncClient.
   // ERR_ABRT: the pcb was aborted.
-  // ERR_OK:   the pcb was already gone, but a queued error event was purged, so the
+  // ERR_OK:   the pcb was already gone, but the client had an undelivered event, so the
   //           caller must still run the discard callback (dispose needs to run).
-  // ERR_CONN: nothing to do (pcb already null and no queued events).
+  // ERR_CONN: nothing to do (pcb already null and nothing pending).
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   if (*msg->pcb) {
     _reset_tcp_callbacks(*msg->pcb, msg->close);
@@ -766,8 +766,7 @@ static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
     *msg->pcb = nullptr;  // PCB is now the property of LwIP
     msg->err = ERR_ABRT;
   } else {
-    // Ensure there is not an error event queued for this client
-    msg->err = AsyncTCP_detail::remove_events_for_client(msg->close) ? ERR_OK : ERR_CONN;
+    msg->err = AsyncTCP_detail::release_pending_event(msg->close) ? ERR_OK : ERR_CONN;
   }
   return msg->err;
 }
