@@ -338,6 +338,13 @@ public:
   void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
 };
 
+static size_t _impl_live_count = 0;  // guarded by _async_queue_mutex
+
+size_t asyncTcpLiveClientCount() {
+  queue_mutex_guard guard;
+  return _impl_live_count;
+}
+
 // Reference counting.  Every cross-thread handoff in this file already passes through
 // _async_queue_mutex or the LwIP core lock, so a plain count under the queue mutex is
 // sufficient - no atomics needed.
@@ -1044,7 +1051,10 @@ AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
   : _facade(facade), _refcount(1), _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0),
     _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0),
     _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME),
-    _connect_port(0), _dns_pending(false), _in_callback_ack_len(0) {}
+    _connect_port(0), _dns_pending(false), _in_callback_ack_len(0) {
+  queue_mutex_guard guard;
+  ++_impl_live_count;
+}
 
 AsyncClientImpl::~AsyncClientImpl() {
   // A bound pcb holds a reference of its own, so the count cannot reach zero while one
@@ -1053,6 +1063,8 @@ AsyncClientImpl::~AsyncClientImpl() {
   if (_pcb) {
     async_tcp_log_e("implementation destroyed with a live pcb");
   }
+  queue_mutex_guard guard;
+  --_impl_live_count;
 }
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(new AsyncClientImpl(this)) {

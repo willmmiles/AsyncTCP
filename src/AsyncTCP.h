@@ -277,6 +277,15 @@ protected:
   AsyncClientImpl *_impl;
 };
 
+/**
+ * @brief number of live client implementations
+ *
+ * A destroyed AsyncClient is still counted while queued events or an outstanding name
+ * lookup hold a reference to it, so this only settles once the event queue has drained.
+ * Intended for leak checks in tests; cheap enough to leave compiled in.
+ */
+size_t asyncTcpLiveClientCount();
+
 class AsyncServer {
 public:
   AsyncServer(ip_addr_t addr, uint16_t port);
