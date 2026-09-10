@@ -729,16 +729,36 @@ static esp_err_t _tcp_abort(tcp_pcb **pcb, AsyncClient *client) {
 
 static err_t _tcp_connect_api(struct tcpip_api_call_data *api_call_msg) {
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
-  msg->err = tcp_connect(*msg->pcb, msg->connect.addr, msg->connect.port, msg->connect.cb);
+  tcp_pcb *pcb = *msg->pcb;
+  // Non-zero only if the caller handed us an already-bound pcb
+  u16_t bound_port = pcb->local_port;
+
+  msg->err = tcp_connect(pcb, msg->connect.addr, msg->connect.port, msg->connect.cb);
+  if (msg->err != ERR_OK) {
+    // LwIP neither frees nor registers the pcb when the connect fails, so it is ours
+    // to dispose of.  No callback can have fired yet: an unregistered pcb is invisible
+    // to LwIP's timers and input path.
+    _reset_tcp_callbacks(pcb, nullptr);
+    if (bound_port == 0) {
+      // tcp_connect() may have taken a local port without adding the pcb to
+      // tcp_bound_pcbs.  Clear it, or tcp_close() will try to remove the pcb from a
+      // list it was never on - which trips an assert on an empty list.
+      pcb->local_port = 0;
+    }
+    if (tcp_close(pcb) != ERR_OK) {
+      tcp_abort(pcb);
+    }
+    *msg->pcb = nullptr;  // PCB is now the property of LwIP
+  }
   return msg->err;
 }
 
-static esp_err_t _tcp_connect(tcp_pcb *pcb, ip_addr_t *addr, uint16_t port, tcp_connected_fn cb) {
-  if (!pcb) {
+static esp_err_t _tcp_connect(tcp_pcb **pcb, ip_addr_t *addr, uint16_t port, tcp_connected_fn cb) {
+  if (!pcb || !*pcb) {
     return ESP_FAIL;
   }
   tcp_api_call_t msg;
-  msg.pcb = &pcb;  // cannot be invalidated by LwIP at this point
+  msg.pcb = pcb;
   msg.connect.addr = addr;
   msg.connect.port = port;
   msg.connect.cb = cb;
@@ -795,19 +815,17 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
  */
 
 AsyncClient::AsyncClient(tcp_pcb *pcb)
-  : _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0),
-    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0),
-    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
-  _pcb = pcb;
-  if (_pcb) {
-    _rx_last_packet = millis();
-    _bind_tcp_callbacks(_pcb, this);
+  : _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0),
+    _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true),
+    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+  if (pcb) {
+    _adopt(pcb);
   }
 }
 
 AsyncClient::~AsyncClient() {
   if (_pcb) {
-    _close();
+    close();
   }
 }
 
@@ -889,11 +907,17 @@ bool AsyncClient::connect(ip_addr_t addr, uint16_t port) {
       async_tcp_log_e("pcb == NULL");
       return false;
     }
-    _bind_tcp_callbacks(pcb, this);
+    // Take ownership now: until _connected() arrives the pcb is only reachable
+    // through us, so close(), abort() and ~AsyncClient() must be able to find it.
+    _adopt(pcb);
   }
 
-  esp_err_t err = _tcp_connect(pcb, &addr, port, (tcp_connected_fn)&_tcp_connected);
-  return err == ESP_OK;
+  if (_tcp_connect(&_pcb, &addr, port, (tcp_connected_fn)&_tcp_connected) == ESP_OK) {
+    return true;
+  }
+  // _pcb is now NULL; no callbacks are raised, as we are returning failure
+  async_tcp_log_d("connect failed");
+  return false;
 }
 
 #ifdef ARDUINO
@@ -960,10 +984,17 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
 }
 
 void AsyncClient::close() {
-  if (_pcb) {
+  if (_pcb && _rx_ack_len) {
+    // Ack anything withheld by ackLater() before we drop the connection
     _tcp_recved(&_pcb, _rx_ack_len);
   }
-  _close();
+  _rx_ack_len = 0;
+  int8_t err = _tcp_close(&_pcb, this);
+  // _pcb is now NULL
+  if ((err == ERR_OK) && _discard_cb) {
+    // _pcb was closed here
+    async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
+  }
 }
 
 int8_t AsyncClient::abort() {
@@ -1035,28 +1066,28 @@ void AsyncClient::ackPacket(struct pbuf *pb) {
  * Main Private Methods
  * */
 
-int8_t AsyncClient::_close() {
-  // ets_printf("X: 0x%08x\n", (uint32_t)this);
-  int8_t err = _tcp_close(&_pcb, this);
-  // _pcb is now NULL
-  if ((err == ERR_OK) && _discard_cb) {
-    // _pcb was closed here
-    async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
-  }
-  return err;
-}
-
 /*
  * Private Callbacks
  * */
 
-int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
-  _pcb = reinterpret_cast<tcp_pcb *>(pcb);
-  if (_pcb) {
-    _rx_last_packet = millis();
-  }
+// Adopt a pcb and reset all per-connection state.  Callers must already be
+// serialized against the LwIP core (accept callback, or tcp_core_guard).
+void AsyncClient::_adopt(tcp_pcb *pcb) {
+  _pcb = pcb;
+  _rx_ack_len = 0;
   _tx_last_packet = 0;
   _rx_last_ack = 0;
+  _rx_last_packet = millis();
+  _bind_tcp_callbacks(pcb, this);
+}
+
+int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
+  if (pcb != _pcb) {
+    // Stale event for a pcb we no longer own
+    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
+    return ERR_OK;
+  }
+  _rx_last_packet = millis();
   if (_connect_cb) {
     async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, this));
   }
@@ -1120,6 +1151,11 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
     return ERR_OK;
   }
 
+  if (_pcb->state < ESTABLISHED) {
+    // Still connecting; LwIP handles the SYN timeout itself
+    return ERR_OK;
+  }
+
   uint32_t now = millis();
 
   // ACK Timeout
@@ -1137,7 +1173,7 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   // RX Timeout
   if (_rx_timeout && (now - _rx_last_packet) >= (_rx_timeout * 1000)) {
     async_tcp_log_d("rx timeout %d", pcb->state);
-    _close();
+    close();
     return ERR_OK;
   }
   // Everything is fine

@@ -300,7 +300,7 @@ protected:
   uint32_t _ack_timeout;
   uint16_t _connect_port;
 
-  int8_t _close();
+  void _adopt(tcp_pcb *pcb);
   int8_t _connected(tcp_pcb *pcb, int8_t err);
   void _error(int8_t err);
   int8_t _poll(tcp_pcb *pcb);
