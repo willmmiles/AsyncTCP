@@ -184,11 +184,32 @@ namespace {
 
 static SemaphoreHandle_t _async_queue_mutex = nullptr;
 
+/*
+  The mutex has to exist before the first AsyncClient does.  The implementation's
+  reference count and the live-client counter are both taken in its constructor, which
+  is earlier than _start_async_task() - previously the only thing that needed the mutex,
+  and where it used to be created.
+
+  Creating it here is unsynchronized, in the same way _start_async_task() always has
+  been: the first client can only be constructed by application code, before the async
+  task exists and before LwIP holds any pointer to us, so there is nothing to race with.
+*/
+static SemaphoreHandle_t _get_queue_mutex() {
+  if (!_async_queue_mutex) {
+    _async_queue_mutex = xSemaphoreCreateMutex();
+  }
+  return _async_queue_mutex;
+}
+
 class queue_mutex_guard {
   bool holds_mutex;
 
 public:
-  inline queue_mutex_guard() : holds_mutex(xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
+  inline queue_mutex_guard() : holds_mutex(false) {
+    SemaphoreHandle_t mutex = _get_queue_mutex();
+    // Only out of memory, and only at startup; carry on unlocked rather than fault
+    holds_mutex = mutex && (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE);
+  };
   inline ~queue_mutex_guard() {
     if (holds_mutex) {
       xSemaphoreGive(_async_queue_mutex);
@@ -597,11 +618,8 @@ static bool customTaskCreateUniversal(
 }
 
 static bool _start_async_task() {
-  if (!_async_queue_mutex) {
-    _async_queue_mutex = xSemaphoreCreateMutex();
-    if (!_async_queue_mutex) {
-      return false;
-    }
+  if (!_get_queue_mutex()) {
+    return false;
   }
 
   if (!_async_service_task_handle) {

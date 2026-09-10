@@ -44,6 +44,10 @@ unsigned notify_count();
 // real target that is a deadlock; here it is recorded and allowed to proceed.
 unsigned deadlocks();
 
+// Takes or gives against a null handle.  FreeRTOS faults on those; the runner treats
+// any occurrence as a test failure.
+unsigned null_semaphores();
+
 // Number of mutexes created and not yet deleted.
 unsigned live_semaphores();
 
@@ -55,7 +59,7 @@ unsigned wdt_deletes();
 
 namespace mockclock {
 
-void reset();                 // back to t=0
+void reset();  // back to t=0
 void set_millis(uint32_t ms);
 void advance(uint32_t ms);
 uint32_t now_millis();

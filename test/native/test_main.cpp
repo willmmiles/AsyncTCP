@@ -62,6 +62,10 @@ int run_all(int argc, char **argv) {
       report_failure(__FILE__, __LINE__, "unexpected exception", "unknown");
     }
 
+    if (mockrtos::null_semaphores()) {
+      report_failure(__FILE__, __LINE__, "semaphore used before it was created", t.name);
+    }
+
     if (t.known_fail) {
       if (g_failures) {
         xfailed++;

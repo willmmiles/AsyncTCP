@@ -111,6 +111,7 @@ struct MockSemaphore {
 
 std::set<MockSemaphore *> g_semaphores;
 unsigned g_deadlocks = 0;
+unsigned g_null_semaphores = 0;
 
 }  // namespace
 
@@ -150,6 +151,9 @@ extern "C" void vSemaphoreDelete(SemaphoreHandle_t xSemaphore) {
 extern "C" BaseType_t xSemaphoreTake(SemaphoreHandle_t xSemaphore, TickType_t) {
   MockSemaphore *s = (MockSemaphore *)xSemaphore;
   if (!s) {
+    // FreeRTOS faults on a null handle - configASSERT, or a null dereference.
+    // Record it rather than returning a quiet pdFALSE that hides the bug.
+    g_null_semaphores++;
     return pdFALSE;
   }
   // Single-threaded, so we can never actually block; a re-take of a
@@ -164,6 +168,7 @@ extern "C" BaseType_t xSemaphoreTake(SemaphoreHandle_t xSemaphore, TickType_t) {
 extern "C" BaseType_t xSemaphoreGive(SemaphoreHandle_t xSemaphore) {
   MockSemaphore *s = (MockSemaphore *)xSemaphore;
   if (!s) {
+    g_null_semaphores++;
     return pdFALSE;
   }
   if (s->depth > 0) {
@@ -211,11 +216,13 @@ extern "C" BaseType_t xTaskCreate(TaskFunction_t fn, const char *, const configS
   return create_task(fn, param, handle);
 }
 
-extern "C" BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *, const configSTACK_DEPTH_TYPE, void *param, UBaseType_t, TaskHandle_t *handle, BaseType_t) {
+extern "C" BaseType_t
+  xTaskCreatePinnedToCore(TaskFunction_t fn, const char *, const configSTACK_DEPTH_TYPE, void *param, UBaseType_t, TaskHandle_t *handle, BaseType_t) {
   return create_task(fn, param, handle);
 }
 
-extern "C" BaseType_t xTaskCreateUniversal(TaskFunction_t fn, const char *, const configSTACK_DEPTH_TYPE, void *param, UBaseType_t, TaskHandle_t *handle, BaseType_t) {
+extern "C" BaseType_t
+  xTaskCreateUniversal(TaskFunction_t fn, const char *, const configSTACK_DEPTH_TYPE, void *param, UBaseType_t, TaskHandle_t *handle, BaseType_t) {
   return create_task(fn, param, handle);
 }
 
@@ -321,6 +328,7 @@ void reset() {
   // stateless.
   g_notify_count = 0;
   g_deadlocks = 0;
+  g_null_semaphores = 0;
   g_pump_events = 0;
   g_wdt_adds = 0;
   g_wdt_deletes = 0;
@@ -333,6 +341,10 @@ void reset() {
 unsigned notify_count() {
   return g_notify_count;
 }
+unsigned null_semaphores() {
+  return g_null_semaphores;
+}
+
 unsigned deadlocks() {
   return g_deadlocks;
 }
