@@ -108,6 +108,9 @@ struct tcp_core_guard {
 */
 #define CONFIG_ASYNC_TCP_POLL_TIMER 1
 
+// Depth of the pending-connection queue handed to tcp_listen_with_backlog()
+#define ASYNCTCP_LISTEN_BACKLOG 5
+
 /*
  * TCP/IP Event Task
  * */
@@ -294,6 +297,36 @@ static size_t _remove_events_for_client(AsyncClient *client) {
   }
   return count;
 };
+
+// Called from AsyncServer::end() on the application thread, so it can destroy any
+// clients that were accepted but never delivered to onClient.
+/*
+  Detach this server's queued accept events.  Safe to call inside the LwIP context, and
+  that is where it belongs: the accept callback that would add more runs on the same
+  thread, so once this returns from there, nothing further can arrive.
+
+  Disposing of the chain is a separate step because it cannot be done from that context -
+  destroying an accepted client closes its pcb, which is an api call.
+*/
+static lwip_tcp_event_packet_t *_detach_events_for_server(AsyncServer *server) {
+  queue_mutex_guard guard;
+  return _async_queue.remove_if([=](lwip_tcp_event_packet_t &pkt) {
+    return (pkt.event == LWIP_TCP_ACCEPT) && (pkt.accept.server == server);
+  });
+}
+
+// Must not run in LwIP context; see above.
+static size_t _dispose_event_chain(lwip_tcp_event_packet_t *chain) {
+  size_t count = 0;
+  while (chain) {
+    ++count;
+    auto t = chain;
+    chain = t->next;
+    delete t->client;
+    _free_event(t);
+  }
+  return count;
+}
 
 void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
   if (e->client == NULL) {
@@ -568,11 +601,6 @@ typedef struct {
       uint16_t port;
       tcp_connected_fn cb;
     } connect;
-    struct {
-      ip_addr_t *addr;
-      uint16_t port;
-    } bind;
-    uint8_t backlog;
   };
 } tcp_api_call_t;
 
@@ -722,50 +750,6 @@ static esp_err_t _tcp_connect(tcp_pcb *pcb, ip_addr_t *addr, uint16_t port, tcp_
   msg.connect.cb = cb;
   tcpip_api_call(_tcp_connect_api, (struct tcpip_api_call_data *)&msg);
   return msg.err;
-}
-
-static err_t _tcp_bind_api(struct tcpip_api_call_data *api_call_msg) {
-  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
-  tcp_pcb *pcb = *msg->pcb;
-  msg->err = tcp_bind(pcb, msg->bind.addr, msg->bind.port);
-  if (msg->err != ERR_OK) {
-    // Close the pcb on behalf of the server without an extra round-trip through the LwIP lock
-    if (tcp_close(pcb) != ERR_OK) {
-      tcp_abort(pcb);
-    }
-    *msg->pcb = nullptr;  // PCB is now owned by LwIP
-  }
-  return msg->err;
-}
-
-static esp_err_t _tcp_bind(tcp_pcb **pcb, ip_addr_t *addr, uint16_t port) {
-  if (!pcb || !*pcb) {
-    return ESP_FAIL;
-  }
-  tcp_api_call_t msg;
-  msg.pcb = pcb;
-  msg.bind.addr = addr;
-  msg.bind.port = port;
-  tcpip_api_call(_tcp_bind_api, (struct tcpip_api_call_data *)&msg);
-  return msg.err;
-}
-
-static err_t _tcp_listen_api(struct tcpip_api_call_data *api_call_msg) {
-  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
-  msg->err = 0;
-  *msg->pcb = tcp_listen_with_backlog(*msg->pcb, msg->backlog);
-  return msg->err;
-}
-
-static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
-  if (!pcb) {
-    return NULL;
-  }
-  tcp_api_call_t msg;
-  msg.pcb = &pcb;
-  msg.backlog = backlog ? backlog : 0xFF;
-  tcpip_api_call(_tcp_listen_api, (struct tcpip_api_call_data *)&msg);
-  return pcb;
 }
 
 /*
@@ -1509,57 +1493,105 @@ void AsyncServer::begin() {
     async_tcp_log_e("failed to start task");
     return;
   }
-  int8_t err;
-  {
-    tcp_core_guard tcg;
+
+  /*
+    Allocate, bind, listen and hook up the accept callback as one transaction.  This used
+    to be five separate entries into the LwIP context, three of them taking only the core
+    lock - which does not exist without CONFIG_LWIP_TCPIP_CORE_LOCKING - so the LwIP thread
+    could see a pcb bound but not listening, or listening with no accept callback and no
+    argument, and _pcb itself was published in stages.
+  */
+  struct begin_call {
+    struct tcpip_api_call_data call;
+    AsyncServer *server;
+    err_t err;
+  } args;
+  args.server = this;
+  args.err = ERR_OK;
+
+  tcpip_api_call(
+    +[](struct tcpip_api_call_data *c) -> err_t {
+      begin_call *a = reinterpret_cast<begin_call *>(c);
+      AsyncServer *server = a->server;
+
 #if LWIP_IPV4 && LWIP_IPV6
-    _pcb = tcp_new_ip_type(_addr.type);
+      tcp_pcb *pcb = tcp_new_ip_type(server->_addr.type);
 #else
-    _pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
+      tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
 #endif
-  }
-  if (!_pcb) {
-    async_tcp_log_e("_pcb == NULL");
-    return;
-  }
+      if (!pcb) {
+        a->err = ERR_MEM;
+        return a->err;
+      }
 
-  err = _tcp_bind(&_pcb, &_addr, _port);
+      a->err = tcp_bind(pcb, &server->_addr, server->_port);
+      if (a->err != ERR_OK) {
+        // Never registered, so nothing can reach it; dispose of it here.
+        if (tcp_close(pcb) != ERR_OK) {
+          tcp_abort(pcb);
+        }
+        return a->err;
+      }
 
-  if (err != ERR_OK) {
-    // pcb was closed by _tcp_bind
-    async_tcp_log_e("bind error: %d", err);
-    return;
-  }
+      tcp_pcb *listen_pcb = tcp_listen_with_backlog(pcb, ASYNCTCP_LISTEN_BACKLOG);
+      if (!listen_pcb) {
+        // LwIP frees the original only on success; ours is still bound, and holds the
+        // port reserved until we release it.
+        if (tcp_close(pcb) != ERR_OK) {
+          tcp_abort(pcb);
+        }
+        a->err = ERR_MEM;
+        return a->err;
+      }
 
-  static uint8_t backlog = 5;
-  tcp_pcb *listen_pcb = _tcp_listen_with_backlog(_pcb, backlog);
-  if (!listen_pcb) {
-    // LwIP frees the original pcb only on success; ours is still bound, and holds
-    // the port reserved until we release it.
-    async_tcp_log_e("listen_pcb == NULL");
-    tcp_core_guard tcg;
-    if (tcp_close(_pcb) != ERR_OK) {
-      tcp_abort(_pcb);
-    }
-    _pcb = nullptr;
-    return;
+      // Published last, and with its callbacks already attached: an accept cannot arrive
+      // against a server that is not ready for it.
+      tcp_arg(listen_pcb, server);
+      tcp_accept(listen_pcb, &AsyncTCP_detail::tcp_accept);
+      server->_pcb = listen_pcb;
+      a->err = ERR_OK;
+      return a->err;
+    },
+    &args.call
+  );
+
+  if (args.err != ERR_OK) {
+    async_tcp_log_e("begin failed: %d", (int)args.err);
   }
-  _pcb = listen_pcb;
-  tcp_core_guard tcg;
-  tcp_arg(_pcb, (void *)this);
-  tcp_accept(_pcb, &AsyncTCP_detail::tcp_accept);
 }
 
 void AsyncServer::end() {
-  if (_pcb) {
-    tcp_core_guard tcg;
-    tcp_arg(_pcb, NULL);
-    tcp_accept(_pcb, NULL);
-    if (tcp_close(_pcb) != ERR_OK) {
-      tcp_abort(_pcb);
-    }
-    _pcb = NULL;
-  }
+  // The mirror of begin(): stop listening and take the queue with it, in one transaction.
+  // Detaching the events is safe here because the accept callback that would add more runs
+  // on this same thread.  Disposing of them is not - destroying an accepted client closes
+  // its pcb, which is an api call - so the chain goes back out to the caller.
+  struct end_call {
+    struct tcpip_api_call_data call;
+    AsyncServer *server;
+    lwip_tcp_event_packet_t *events;
+  } args;
+  args.server = this;
+  args.events = nullptr;
+
+  tcpip_api_call(
+    +[](struct tcpip_api_call_data *c) -> err_t {
+      end_call *a = reinterpret_cast<end_call *>(c);
+      AsyncServer *server = a->server;
+      if (server->_pcb) {
+        tcp_arg(server->_pcb, NULL);
+        tcp_accept(server->_pcb, NULL);
+        if (tcp_close(server->_pcb) != ERR_OK) {
+          tcp_abort(server->_pcb);
+        }
+        server->_pcb = NULL;  // PCB is now the property of LwIP
+      }
+      a->events = _detach_events_for_server(server);
+      return ERR_OK;
+    },
+    &args.call
+  );
+
+  _dispose_event_chain(args.events);
 }
 
 // runs on LwIP thread
