@@ -1,7 +1,7 @@
 # Refcounted implementation object
 
-Status: **implemented** on this branch, verified by host tests only.
-No hardware run yet, and no performance measurement yet - see Remaining.
+Status: **implemented and running on hardware**.
+47 host tests and 12 on-target tests pass; no performance measurement yet.
 
 ## Why
 
@@ -147,7 +147,9 @@ Answers to the questions the plan raised:
 - **Header leakage**: gone. `AsyncTCP.h` has the public API and an opaque pointer.
 - **`tcp_*_api`**: `_tcp_close`/`_tcp_abort` take the implementation.
 
-Two bugs the host tests caught that three green target builds did not:
+### Bugs found after the migration compiled
+
+Two the host tests caught that three green target builds did not:
 
 1. `AsyncClientImpl::ackLater()` declared but never defined - it had been inline in the
    header, so the migration left nothing behind. Nothing in the examples calls it, so it
@@ -156,14 +158,33 @@ Two bugs the host tests caught that three green target builds did not:
    `_get_async_event()` was calling it *while holding* that non-recursive mutex. It
    would have hung on the first coalesced poll event under load.
 
+And one that only hardware could find (`5f36c33`): the queue mutex was created lazily by
+`_start_async_task()`, which was early enough when the async task was the only user, but
+the implementation takes it in its *constructor*. The first `AsyncClient` therefore
+called `xSemaphoreTake(nullptr)` and the board panicked before reaching test 2. The mock
+returned a quiet `pdFALSE` where FreeRTOS faults; it now counts null-handle operations
+and the runner fails on them, which reproduces the crash on the host.
+
+### On-target results
+
+`examples/LifetimeTests`, esp32dev, **12/12**. Destroying a client from inside `onError`
+and from inside `onData` both survive, closing from inside `onData` acks the packet, an
+abandoned lookup settles, and every path returns `asyncTcpLiveClientCount()` to its
+baseline.
+
+Two things about the sketch worth knowing. Everything past construction needs the TCP/IP
+stack running, because `connect()` takes the LwIP core lock - `WiFi.mode(WIFI_STA)` is
+enough. And the peer is `127.0.0.1`, not the board's own station address: packets
+addressed to the station IP are not looped back by default and simply never arrive. No
+association is needed, so credentials only affect whether test 6's lookup reaches a real
+resolver.
+
 ## Remaining
 
 - **Pre-allocate the terminal event.** Still the one hole: if `tcp_error` cannot
   allocate, the client is orphaned with no way to report. With an implementation object
   it can be allocated once at construction. Small, orthogonal, and now the only thing
   keeping that window open.
-- **Hardware run.** `examples/LifetimeTests` is a self-checking sketch; tests 1-6 need
-  no network, 7-12 run a server on the board and connect to it.
 - **Performance.** Compare against the pre-migration branch using the ESPAsyncWebServer
   benchmarks. The refcount adds one guarded increment per event; the pimpl adds one
   indirection per accessor. Neither has been measured.
