@@ -1,6 +1,7 @@
 # Refcounted implementation object
 
-Status: **planning**. Nothing implemented yet.
+Status: **implemented** on this branch, verified by host tests only.
+No hardware run yet, and no performance measurement yet - see Remaining.
 
 ## Why
 
@@ -113,58 +114,66 @@ order, so taking it there is fine.
 - **Downstream testing.** ESPAsyncWebServer already uses `shared_ptr` for its own
   request lifetime and is the main consumer of the API being changed.
 
-## Sequencing
+## What landed
 
-`close-in-callback-safety` and `yet-more-safety` are **superseded, not landed**. The
-whole point is to skip the commits that solve problems refcounting solves anyway.
-What matters is that the fixes they contain are not discarded along with the
-mechanisms.
+Seven fixes re-landed from the abandoned branches, then the migration:
 
-### Re-land from `main` as an independent series
-
-Orthogonal to ownership — nothing to do with refcounting, and worth shipping without
-waiting for this refactor.
-
-| Commit | Note |
+| Commit | |
 |---|---|
-| `681d3d3` remove unreferenced function | clean pick |
-| `c214858` null-guard setKeepAlive | clean pick |
-| `51e38dd` close bound pcb on listen failure | clean pick |
-| `c7911e7` drop queued accept events on end | clean pick |
-| `46a102a` accept path cleanup | clean pick |
-| `fcddcb7` reset per-connection state on adopt | adapt — its ack flush walks `_cb_ctx`, which will not exist |
-| `ac36acd` DNS fixes | adapt — keep the bug fixes, drop the pending-event mechanism |
+| `ef69151` | remove unreferenced function |
+| `578d0f3` | null-guard `setKeepAlive` |
+| `255d16c` | close the bound pcb when listen fails |
+| `061354a` | drop queued accept events on `end()` |
+| `fe158b5` | accept-path cleanup (reset callbacks *and* destroy the client) |
+| `a4e3ac3` | reset per-connection state on adopt; dispose the pcb on failed connect |
+| `0a08f66` | report DNS failures instead of connecting to 0.0.0.0 |
+| `5113e63` | **the migration** |
+| `3a74bbe` | `asyncTcpLiveClientCount()` + on-target lifetime sketch |
+| `54238cb` | stop casting pcb pointers to `uint32_t` when logging |
+| `1e96560` | host-native harness, 47 tests |
 
-### Superseded — do not port
+Answers to the questions the plan raised:
 
-| Commit | Replaced by |
-|---|---|
-| `6ebddca` ensure callbacks handle destruction | dispatcher holds a reference; `detached` flag |
-| `6439d9d` warning disable generates warnings | the `-Wdangling-pointer` pragma exists only for `_cb_ctx` |
-| `88c11a7` ack final pbuf (mechanism only) | `ack_len` moves into the impl |
-| `7c6d728` pending error event | queue holds a reference |
-| `31a8859` test pending event in close/abort | ditto |
-| `d6cd4b5` pre-commit fixes | formatting on the above |
+- **Refcount**: plain `uint16_t` guarded by `_async_queue_mutex`, no atomics. Holders
+  are the facade, each queued event, LwIP's callback argument while a pcb is bound, and
+  an outstanding lookup.
+- **Last reference on the wrong thread**: solved by construction. A bound pcb holds a
+  reference, so the count cannot reach zero while one is attached, and the destructor
+  never has to close anything. It logs if that invariant is ever violated.
+- **`ack_len` nesting**: `_in_callback_ack_len` is a single field on the implementation.
+  A nested frame never reads it, so no chain is needed. `_cb_ctx` is gone entirely.
+- **DNS holds a reference until timeout**: yes, and that is now the documented behavior
+  rather than a dangling pointer. `close()`/`abort()` mark the answer unwanted.
+- **Header leakage**: gone. `AsyncTCP.h` has the public API and an opaque pointer.
+- **`tcp_*_api`**: `_tcp_close`/`_tcp_abort` take the implementation.
 
-### Behavior that must survive
+Two bugs the host tests caught that three green target builds did not:
 
-Dropping the commits must not drop the bugs they found. There are no unit tests in
-this repo, so this list is the only record. Each was a real, reproduced defect:
+1. `AsyncClientImpl::ackLater()` declared but never defined - it had been inline in the
+   header, so the migration left nothing behind. Nothing in the examples calls it, so it
+   linked fine on target.
+2. A deadlock: `_free_event()` releases a reference, which takes the queue mutex, and
+   `_get_async_event()` was calling it *while holding* that non-recursive mutex. It
+   would have hung on the first coalesced poll event under load.
 
-- Closing inside `onData` must ack the final pbuf, or the peer gets RST not FIN (`88c11a7`)
-- Destroying a client inside any user callback must be safe (`6ebddca`)
-- A failed DNS lookup must raise `-55`, not connect to `0.0.0.0` (`ac36acd`)
-- `connect(host, port)` returning true must end in exactly one `onConnect` or `onError` (`ac36acd`)
-- A second `connect()` during an outstanding lookup is swallowed and returns true (`ac36acd`)
-- `tcp_error` for a client that does not own the failed pcb must not queue an event (`7c6d728`)
-- `tcp_connect()` failure must dispose of the pcb, clearing `local_port` first unless we were handed a bound one (`fcddcb7`)
-- Poll processing must be skipped while still connecting (`fcddcb7`)
-- A stale `_rx_ack_len` must not survive into a reconnect (`fcddcb7`)
-- `AsyncServer::begin()` must close the bound pcb when listen fails, or the port stays reserved for the boot (`51e38dd`)
-- Accept-event allocation failure must reset callbacks before abort *and* destroy the client (`46a102a`)
+## Remaining
 
-### Still outstanding either way
-
-**Pre-allocating the terminal event** so `tcp_error` cannot fail to report under
-memory pressure. Small, orthogonal, closes a live hole — and with an impl it gets a
-better home, allocated once at impl construction rather than at every pcb adoption.
+- **Pre-allocate the terminal event.** Still the one hole: if `tcp_error` cannot
+  allocate, the client is orphaned with no way to report. With an implementation object
+  it can be allocated once at construction. Small, orthogonal, and now the only thing
+  keeping that window open.
+- **Hardware run.** `examples/LifetimeTests` is a self-checking sketch; tests 1-6 need
+  no network, 7-12 run a server on the board and connect to it.
+- **Performance.** Compare against the pre-migration branch using the ESPAsyncWebServer
+  benchmarks. The refcount adds one guarded increment per event; the pimpl adds one
+  indirection per accessor. Neither has been measured.
+- **ESPAsyncWebServer compatibility.** It deletes an `AsyncClient` from inside that
+  client's own `onDisconnect`, which is precisely the path this refactor changes. Build
+  and run it before believing any of this.
+- **Public API breaks not yet taken.** `AsyncClient::pcb()` and `_recv()` are still
+  public and still work; the `AsyncClient(tcp_pcb*)` constructor is still public. The
+  plan was to make them private with a `friend`, which would be a source break for
+  anyone using them.
+- **Races.** The harness is single-threaded by construction and cannot find them. The
+  one known unsynchronized read is `_facade` in the dispatcher, which is the same shape
+  as the pre-existing unlocked `_pcb` reads.
