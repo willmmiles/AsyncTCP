@@ -1322,6 +1322,10 @@ void AsyncClientImpl::ackPacket(struct pbuf *pb) {
 // serialized against the LwIP core (accept callback, or tcp_core_guard).
 // LwIP has no way to cancel a lookup, so record that we no longer want the answer.
 // tcp_dns_found() drops it and releases LwIP's reference when it eventually fires.
+void AsyncClientImpl::ackLater() {
+  _ack_pcb = false;
+}
+
 void AsyncClientImpl::_abandonResolve() {
   queue_mutex_guard guard;
   _dns_pending = false;
@@ -1453,6 +1457,11 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
 }
 
 void AsyncClientImpl::_dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port) {
+  if (resolved && ip_addr_isany_val(*ipaddr)) {
+    // A resolver that answers with the any-address - a sinkhole, or a blocklist - has
+    // not given us anywhere to go.  Report it as a failed lookup rather than dialling it.
+    resolved = false;
+  }
   if (resolved && connect(*ipaddr, port)) {
     return;
   }
