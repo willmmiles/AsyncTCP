@@ -295,6 +295,28 @@ static size_t _remove_events_for_client(AsyncClient *client) {
   return count;
 };
 
+// Called from AsyncServer::end() on the application thread, so it can destroy any
+// clients that were accepted but never delivered to onClient.
+static size_t _remove_events_for_server(AsyncServer *server) {
+  lwip_tcp_event_packet_t *removed_event_chain;
+  {
+    queue_mutex_guard guard;
+    removed_event_chain = _async_queue.remove_if([=](lwip_tcp_event_packet_t &pkt) {
+      return (pkt.event == LWIP_TCP_ACCEPT) && (pkt.accept.server == server);
+    });
+  }
+
+  size_t count = 0;
+  while (removed_event_chain) {
+    ++count;
+    auto t = removed_event_chain;
+    removed_event_chain = t->next;
+    delete t->client;
+    _free_event(t);
+  }
+  return count;
+};
+
 void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
   if (e->client == NULL) {
     // do nothing when arg is NULL
@@ -1552,13 +1574,17 @@ void AsyncServer::begin() {
 
 void AsyncServer::end() {
   if (_pcb) {
-    tcp_core_guard tcg;
-    tcp_arg(_pcb, NULL);
-    tcp_accept(_pcb, NULL);
-    if (tcp_close(_pcb) != ERR_OK) {
-      tcp_abort(_pcb);
+    {
+      tcp_core_guard tcg;
+      tcp_arg(_pcb, NULL);
+      tcp_accept(_pcb, NULL);
+      if (tcp_close(_pcb) != ERR_OK) {
+        tcp_abort(_pcb);
+      }
+      _pcb = NULL;
     }
-    _pcb = NULL;
+    // No further accept callbacks can fire, so anything still queued is the last of it.
+    _remove_events_for_server(this);
   }
 }
 
