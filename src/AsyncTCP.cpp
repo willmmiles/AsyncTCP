@@ -1564,45 +1564,45 @@ void AsyncServer::end() {
 
 // runs on LwIP thread
 int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
+  // Note LwIP return value semantics:
+  //  - ERR_OK: delivery successful
+  //  - ERR_ABRT: the connection was aborted, discard your reference
+  //  - Anything else: abort the connection
+
   if (!pcb) {
     async_tcp_log_e("_accept failed: pcb is NULL");
     return ERR_ABRT;
   }
+
   auto server = reinterpret_cast<AsyncServer *>(arg);
-  if (server->_connect_cb) {
-    AsyncClient *c = new (std::nothrow) AsyncClient(pcb);
-    if (c && c->pcb()) {
-      c->setNoDelay(server->_noDelay);
-
-      lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ACCEPT, c};
-      if (e) {
-        e->accept.server = server;
-
-        queue_mutex_guard guard;
-        _prepend_async_event(e);
-        return ERR_OK;  // success
-      }
-
-      // Couldn't allocate accept event
-      // We can't let the client object call in to close, as we're on the LWIP thread; it could deadlock trying to RPC to itself
-      c->_pcb = nullptr;
-      tcp_abort(pcb);
-      async_tcp_log_e("_accept failed: couldn't accept client");
-      return ERR_ABRT;
-    }
-    if (c) {
-      // Couldn't complete setup
-      // pcb has already been aborted
-      delete c;
-      pcb = nullptr;
-      async_tcp_log_e("_accept failed: couldn't complete setup");
-      return ERR_ABRT;
-    }
-    async_tcp_log_e("_accept failed: couldn't allocate client");
-  } else {
+  if (!server->_connect_cb) {
     async_tcp_log_e("_accept failed: no onConnect callback");
+    tcp_abort(pcb);
+    return ERR_ABRT;
   }
-  tcp_abort(pcb);
+
+  // Queue the accept event for processing by the async task.
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ACCEPT, nullptr};
+  if (!e) {
+    async_tcp_log_e("_accept failed: couldn't allocate event");
+    tcp_abort(pcb);
+    return ERR_ABRT;
+  }
+
+  AsyncClient *c = new (std::nothrow) AsyncClient(pcb);
+  if (!c) {
+    _free_event(e);
+    async_tcp_log_e("_accept failed: couldn't allocate client");
+    tcp_abort(pcb);
+    return ERR_ABRT;
+  }
+
+  c->setNoDelay(server->_noDelay);
+  e->client = c;
+  e->accept.server = server;
+
+  queue_mutex_guard guard;
+  _prepend_async_event(e);
   return ERR_OK;
 }
 
