@@ -306,7 +306,7 @@ protected:
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  void _dns_found(ip_addr_t *ipaddr);
+  void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
 };
 
 class AsyncServer {

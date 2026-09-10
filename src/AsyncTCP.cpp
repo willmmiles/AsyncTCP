@@ -155,8 +155,9 @@ struct lwip_tcp_event_packet_t {
       AsyncServer *server;
     } accept;
     struct {
-      const char *name;
       ip_addr_t addr;
+      uint16_t port;
+      bool resolved;
     } dns;
   };
 
@@ -175,6 +176,7 @@ public:
   static void __attribute__((visibility("internal"))) tcp_error(void *arg, int8_t err);
   static int8_t __attribute__((visibility("internal"))) tcp_poll(void *arg, struct tcp_pcb *pcb);
   static int8_t __attribute__((visibility("internal"))) tcp_accept(void *arg, tcp_pcb *pcb, int8_t err);
+  static void __attribute__((visibility("internal"))) tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg);
 };
 
 // Guard class for the global queue
@@ -344,8 +346,8 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
     // ets_printf("A: 0x%08x 0x%08x\n", e->client, e->accept.client);
     e->accept.server->_accepted(e->client);
   } else if (e->event == LWIP_TCP_DNS) {
-    // ets_printf("D: 0x%08x %s = %s\n", e->client, e->dns.name, ipaddr_ntoa(&e->dns.addr));
-    e->client->_dns_found(&e->dns.addr);
+    // ets_printf("D: 0x%08x = %s\n", e->client, ipaddr_ntoa(&e->dns.addr));
+    e->client->_dns_found(e->dns.resolved, &e->dns.addr, e->dns.port);
   }
   _free_event(e);
 }
@@ -546,8 +548,10 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   _send_async_event(e);
 }
 
-static void _tcp_dns_found(const char *name, ip_addr_t *ipaddr, void *arg) {
+void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg) {
   // ets_printf("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
+  // 'name' points into LwIP's DNS table, which the next lookup recycles; don't keep it.
+  (void)name;
   auto client = reinterpret_cast<AsyncClient *>(arg);
 
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client};
@@ -556,7 +560,8 @@ static void _tcp_dns_found(const char *name, ip_addr_t *ipaddr, void *arg) {
     return;
   }
 
-  e->dns.name = name;
+  e->dns.port = client->_connect_port;
+  e->dns.resolved = (ipaddr != nullptr);
   if (ipaddr) {
     memcpy(&e->dns.addr, ipaddr, sizeof(ip_addr_t));
   } else {
@@ -959,7 +964,7 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
   err_t err;
   {
     tcp_core_guard tcg;
-    err = dns_gethostbyname(host, &addr, (dns_found_callback)&_tcp_dns_found, this);
+    err = dns_gethostbyname(host, &addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, this);
   }
 
   if (err == ERR_OK) {
@@ -1183,17 +1188,13 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   return ERR_OK;
 }
 
-void AsyncClient::_dns_found(ip_addr_t *ipaddr) {
-  if (ipaddr) {
-    connect(*ipaddr, _connect_port);
-  } else {
-    if (_error_cb) {
-      async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, this, -55));
-    }
-    if (_discard_cb) {
-      async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
-    }
+void AsyncClient::_dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port) {
+  if (resolved && connect(*ipaddr, port)) {
+    return;
   }
+  // connect() reported success to the caller, so this attempt owes them exactly one
+  // of onConnect or onError.
+  _error(resolved ? ERR_CONN : -55);
 }
 
 /*
