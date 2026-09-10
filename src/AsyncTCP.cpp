@@ -1339,7 +1339,7 @@ void AsyncClientImpl::_adopt(tcp_pcb *pcb) {
 int8_t AsyncClientImpl::_connected(tcp_pcb *pcb, int8_t err) {
   if (pcb != _pcb) {
     // Stale event for a pcb we no longer own
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
+    async_tcp_log_d("%p != %p", (const void *)pcb, (const void *)_pcb);
     return ERR_OK;
   }
   _rx_last_packet = millis();
@@ -1416,7 +1416,7 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
     return ERR_OK;
   }
   if (pcb != _pcb) {
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
+    async_tcp_log_d("%p != %p", (const void *)pcb, (const void *)_pcb);
     return ERR_OK;
   }
 
