@@ -1050,21 +1050,6 @@ void AsyncClient::_error(int8_t err) {
   }
 }
 
-// In LwIP Thread
-int8_t AsyncClient::_lwip_fin(tcp_pcb *pcb, int8_t err) {
-  if (!_pcb || pcb != _pcb) {
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
-    return ERR_OK;
-  }
-  _reset_tcp_callbacks(_pcb, this);
-  if (tcp_close(_pcb) != ERR_OK) {
-    tcp_abort(_pcb);
-  }
-  _pcb = NULL;
-  return ERR_OK;
-}
-
-// In Async Thread
 int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
   close();
   return ERR_OK;
