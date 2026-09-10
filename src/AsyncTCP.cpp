@@ -5,6 +5,24 @@
 #include "AsyncTCPLogging.h"
 #include "AsyncTCPSimpleIntrusiveList.h"
 
+#include <atomic>
+
+/*
+  The reference count wants to be lock-free: it sits on the per-event path, and a
+  FreeRTOS mutex there costs real throughput (measured at 2.3x the lock traffic per
+  request, worst on builds without CONFIG_LWIP_TCPIP_CORE_LOCKING).
+
+  Not every target this library builds for can do it.  Cortex-M0 has no exclusive-access
+  instructions, so std::atomic lowers to libatomic calls that are not linked.  Those
+  targets fall back to the queue mutex; they are single core and nowhere near the
+  throughput where the difference shows.
+*/
+#if defined(ATOMIC_INT_LOCK_FREE) && (ATOMIC_INT_LOCK_FREE == 2)
+#define ASYNCTCP_ATOMIC_REFCOUNT 1
+#else
+#define ASYNCTCP_ATOMIC_REFCOUNT 0
+#endif
+
 /**
  * LibreTiny specific configurations
  */
@@ -253,7 +271,11 @@ public:
   AsyncClientImpl &operator=(const AsyncClientImpl &) = delete;
 
   AsyncClient *_facade;  // nulled once the application's object is destroyed
-  uint16_t _refcount;    // guarded by _async_queue_mutex
+#if ASYNCTCP_ATOMIC_REFCOUNT
+  std::atomic<uint32_t> _refcount;
+#else
+  uint32_t _refcount;  // guarded by _async_queue_mutex
+#endif
 
   tcp_pcb *_pcb;
 
@@ -359,42 +381,61 @@ public:
   void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
 };
 
-static size_t _impl_live_count = 0;  // guarded by _async_queue_mutex
+#if ASYNCTCP_ATOMIC_REFCOUNT
+static std::atomic<size_t> _impl_live_count{0};
+#else
+static size_t _impl_live_count = 0;
+#endif
 
 size_t asyncTcpLiveClientCount() {
+#if ASYNCTCP_ATOMIC_REFCOUNT
+  return _impl_live_count.load(std::memory_order_relaxed);
+#else
   queue_mutex_guard guard;
   return _impl_live_count;
+#endif
 }
 
-// Reference counting.  Every cross-thread handoff in this file already passes through
-// _async_queue_mutex or the LwIP core lock, so a plain count under the queue mutex is
-// sufficient - no atomics needed.
-static void _impl_ref(AsyncClientImpl *impl) {
+/*
+  Reference counting is lock-free.
+
+  An earlier version guarded the count with _async_queue_mutex, on the grounds that
+  every cross-thread handoff already passes through it.  That was true but expensive:
+  it put a FreeRTOS mutex on the per-event path and more than doubled the lock traffic
+  per request.  It costs most on builds without CONFIG_LWIP_TCPIP_CORE_LOCKING, where
+  the async task blocks in the LwIP mailbox on every api call while the LwIP thread -
+  at a much higher priority - contends for the same mutex.
+
+  _facade still needs the queue mutex, because clearing it has to interlock with the
+  enqueue in tcp_dns_found().  Only the count moves.
+*/
+static inline void _impl_ref(AsyncClientImpl *impl) {
   if (!impl) {
     return;
   }
+#if ASYNCTCP_ATOMIC_REFCOUNT
+  impl->_refcount.fetch_add(1, std::memory_order_relaxed);
+#else
   queue_mutex_guard guard;
   ++impl->_refcount;
-}
-
-// Caller already holds the queue mutex.  Taking it again for the reference would
-// double the lock traffic on the hot path, where every event does an enqueue anyway.
-static inline void _impl_ref_locked(AsyncClientImpl *impl) {
-  if (impl) {
-    ++impl->_refcount;
-  }
+#endif
 }
 
 static void _impl_unref(AsyncClientImpl *impl) {
   if (!impl) {
     return;
   }
+#if ASYNCTCP_ATOMIC_REFCOUNT
+  // acq_rel so everything the releasing thread wrote is visible to whoever destroys it
+  const bool last = (impl->_refcount.fetch_sub(1, std::memory_order_acq_rel) == 1);
+#else
   bool last;
   {
     queue_mutex_guard guard;
     last = (--impl->_refcount == 0);
   }
-  // Destroy outside the mutex: nothing else can reach it at zero.
+#endif
+  // Destroy outside any lock: nothing else can reach it at zero.
   if (last) {
     delete impl;
   }
@@ -679,7 +720,7 @@ static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   e->connected.pcb = pcb;
   e->connected.err = err;
   queue_mutex_guard guard;
-  _impl_ref_locked(client);
+  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -705,7 +746,7 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
   e->poll.pcb = pcb;
 
   queue_mutex_guard guard;
-  _impl_ref_locked(client);
+  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -730,7 +771,7 @@ int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb
   }
 
   queue_mutex_guard guard;
-  _impl_ref_locked(client);
+  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -747,7 +788,7 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   e->sent.len = len;
 
   queue_mutex_guard guard;
-  _impl_ref_locked(client);
+  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -1074,8 +1115,12 @@ AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
     _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0),
     _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME),
     _connect_port(0), _dns_pending(false), _in_callback_ack_len(0) {
+#if ASYNCTCP_ATOMIC_REFCOUNT
+  _impl_live_count.fetch_add(1, std::memory_order_relaxed);
+#else
   queue_mutex_guard guard;
   ++_impl_live_count;
+#endif
 }
 
 AsyncClientImpl::~AsyncClientImpl() {
@@ -1085,8 +1130,12 @@ AsyncClientImpl::~AsyncClientImpl() {
   if (_pcb) {
     async_tcp_log_e("implementation destroyed with a live pcb");
   }
+#if ASYNCTCP_ATOMIC_REFCOUNT
+  _impl_live_count.fetch_sub(1, std::memory_order_relaxed);
+#else
   queue_mutex_guard guard;
   --_impl_live_count;
+#endif
 }
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(new AsyncClientImpl(this)) {
