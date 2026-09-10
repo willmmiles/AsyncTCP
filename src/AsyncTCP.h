@@ -72,6 +72,7 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 
 struct tcp_pcb;
 class AsyncTCP_detail;
+class AsyncClientImpl;
 
 class AsyncClient {
 public:
@@ -256,57 +257,24 @@ public:
   // ack data that you have not acked using the method below
   size_t ack(size_t len);
   // will not ack the current packet. Call from onData
-  void ackLater() {
-    _ack_pcb = false;
-  }
+  void ackLater();
 
   static const char *errorToString(int8_t error);
   const char *stateToString() const;
 
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
-  tcp_pcb *pcb() {
-    return _pcb;
-  }
+  tcp_pcb *pcb();
 
 protected:
   friend class AsyncTCP_detail;
   friend class AsyncServer;
 
-  tcp_pcb *_pcb;
-
-  AcConnectHandler _connect_cb;
-  void *_connect_cb_arg;
-  AcConnectHandler _discard_cb;
-  void *_discard_cb_arg;
-  AcAckHandler _sent_cb;
-  void *_sent_cb_arg;
-  AcErrorHandler _error_cb;
-  void *_error_cb_arg;
-  AcDataHandler _recv_cb;
-  void *_recv_cb_arg;
-  AcPacketHandler _pb_cb;
-  void *_pb_cb_arg;
-  AcTimeoutHandler _timeout_cb;
-  void *_timeout_cb_arg;
-  AcConnectHandler _poll_cb;
-  void *_poll_cb_arg;
-
-  bool _ack_pcb;
-  uint32_t _tx_last_packet;
-  uint32_t _rx_ack_len;
-  uint32_t _rx_last_packet;
-  uint32_t _rx_timeout;
-  uint32_t _rx_last_ack;
-  uint32_t _ack_timeout;
-  uint16_t _connect_port;
-
-  void _adopt(tcp_pcb *pcb);
-  int8_t _connected(tcp_pcb *pcb, int8_t err);
-  void _error(int8_t err);
-  int8_t _poll(tcp_pcb *pcb);
-  int8_t _sent(tcp_pcb *pcb, uint16_t len);
-  int8_t _fin(tcp_pcb *pcb, int8_t err);
-  void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
+  // Every scrap of state lives in the implementation object, which is reference
+  // counted and outlives this facade: the event queue, LwIP's callback argument and
+  // any outstanding name lookup all hold a reference.  That keeps the callbacks
+  // themselves alive for the duration of a call, so destroying an AsyncClient from
+  // inside one of its own callbacks is safe.
+  AsyncClientImpl *_impl;
 };
 
 class AsyncServer {
