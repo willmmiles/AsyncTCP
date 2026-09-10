@@ -377,6 +377,14 @@ static void _impl_ref(AsyncClientImpl *impl) {
   ++impl->_refcount;
 }
 
+// Caller already holds the queue mutex.  Taking it again for the reference would
+// double the lock traffic on the hot path, where every event does an enqueue anyway.
+static inline void _impl_ref_locked(AsyncClientImpl *impl) {
+  if (impl) {
+    ++impl->_refcount;
+  }
+}
+
 static void _impl_unref(AsyncClientImpl *impl) {
   if (!impl) {
     return;
@@ -663,16 +671,15 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
 static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   // ets_printf("+C: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  _impl_ref(client);
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_CONNECTED, client};
   if (!e) {
-    _impl_unref(client);  // the event never took the reference
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
   }
   e->connected.pcb = pcb;
   e->connected.err = err;
   queue_mutex_guard guard;
+  _impl_ref_locked(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -690,26 +697,23 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
 
   // ets_printf("+P: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  _impl_ref(client);
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_POLL, client};
   if (!e) {
-    _impl_unref(client);  // the event never took the reference
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
   }
   e->poll.pcb = pcb;
 
   queue_mutex_guard guard;
+  _impl_ref_locked(client);
   _send_async_event(e);
   return ERR_OK;
 }
 
 int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  _impl_ref(client);
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_RECV, client};
   if (!e) {
-    _impl_unref(client);  // the event never took the reference
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
   }
@@ -726,6 +730,7 @@ int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb
   }
 
   queue_mutex_guard guard;
+  _impl_ref_locked(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -733,10 +738,8 @@ int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb
 int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   // ets_printf("+S: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  _impl_ref(client);
   lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_SENT, client};
   if (!e) {
-    _impl_unref(client);  // the event never took the reference
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
   }
@@ -744,6 +747,7 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   e->sent.len = len;
 
   queue_mutex_guard guard;
+  _impl_ref_locked(client);
   _send_async_event(e);
   return ERR_OK;
 }
