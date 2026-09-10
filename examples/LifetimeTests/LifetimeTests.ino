@@ -2,11 +2,12 @@
 //
 // These exercise the object-lifetime paths that are hard to reach from ordinary use:
 // destroying a client from inside its own callbacks, abandoning a name lookup, and
-// failed connects.  Each test finishes by waiting for asyncTcpLiveClientCount() to
-// settle back to its baseline, which is what catches a leaked reference.
+// connections that fail.  Each test finishes by waiting for asyncTcpLiveClientCount()
+// to settle back to its baseline, which is what catches a leaked reference.
 //
-// Tests 1-6 need no network.  Tests 7-10 connect the board to a server running on
-// itself, so they need WiFi; set the credentials below or they will be skipped.
+// Everything past the first test needs the TCP/IP stack running - connect() takes the
+// LwIP core lock, which does not exist until then - and the peer for most of them is a
+// server on this same board, so WiFi credentials are required.
 //
 // To build: set `src_dir = examples/LifetimeTests` in platformio.ini, then
 //   pio run -e arduino-3 -t upload && pio device monitor
@@ -16,9 +17,15 @@
 #include <AsyncTCP.h>
 #include <WiFi.h>
 
-static const char *WIFI_SSID = "";  // leave empty to skip the networked tests
+static const char *WIFI_SSID = "";  // only affects test 6; the peer is loopback
 static const char *WIFI_PASS = "";
 static const uint16_t TEST_PORT = 8099;
+static const uint16_t DEAD_PORT = 8100;  // nothing ever listens here
+
+// The peer for every networked test is a server on this same board.  Packets addressed
+// to our own station address are not looped back by default, so use the dedicated
+// loopback interface instead.
+static const IPAddress kPeer(127, 0, 0, 1);
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -50,14 +57,19 @@ static bool waitClients(size_t expected, uint32_t timeout_ms) {
   return false;
 }
 
-// ---------------------------------------------------------------- no network needed
+static AsyncServer *g_server = nullptr;
+static volatile int g_accepts = 0;
+
+// ---------------------------------------------------------------------------
 
 static void test_construct_destroy(size_t base) {
   { AsyncClient c; }
   check("1. construct and destroy leaks nothing", waitClients(base, 1000));
 }
 
-static void test_connect_unroutable(size_t base) {
+// A closed port on our own address gives us a prompt RST, which is a far more
+// deterministic error than waiting out a SYN timeout to an unroutable address.
+static void test_refused_connect(size_t base) {
   static volatile bool errored = false;
   errored = false;
   {
@@ -65,12 +77,13 @@ static void test_connect_unroutable(size_t base) {
     c.onError([](void *, AsyncClient *, int8_t) {
       errored = true;
     });
-    // 192.0.2.0/24 is reserved for documentation and should never route
-    IPAddress unroutable(192, 0, 2, 1);
-    c.connect(unroutable, 80);
-    waitFlag(errored, 15000);
+    bool started = c.connect(kPeer, DEAD_PORT);
+    if (!started) {
+      Serial.println("    (connect() returned false - no callback is owed)");
+    }
+    waitFlag(errored, 10000);
+    check("2. refused connect reports an error", started && errored);
   }
-  check("2. unroutable connect reports an error", errored);
   check("3. ...and leaks nothing once it settles", waitClients(base, 5000));
 }
 
@@ -86,34 +99,35 @@ static void test_destroy_inside_onerror(size_t base) {
     },
     c
   );
-  IPAddress unroutable(192, 0, 2, 2);
-  c->connect(unroutable, 80);
-  waitFlag(errored, 15000);
-  check("4. destroying the client inside onError survives", errored);
+  bool started = c->connect(kPeer, DEAD_PORT);
+  if (started) {
+    waitFlag(errored, 10000);
+  }
+  if (!errored) {
+    delete c;  // the callback never ran, so it is still ours to release
+  }
+  check("4. destroying the client inside onError survives", started && errored);
   check("5. ...and leaks nothing once it settles", waitClients(base, 5000));
 }
 
 static void test_abandoned_lookup(size_t base) {
   {
     AsyncClient c;
-    // No DNS server configured yet, so this either fails immediately or stays pending
-    c.connect("test-host-that-does-not-exist.invalid", 80);
+    bool started = c.connect("test-host-that-does-not-exist.invalid", 80);
+    Serial.printf("    (lookup started: %s)\n", started ? "yes" : "no");
     c.close();  // abandon it while it may still be in flight
   }
   // LwIP cannot cancel a lookup, so the reference lives until its timeout fires
   check("6. closing during a lookup leaks nothing (slow: DNS timeout)", waitClients(base, 45000));
 }
 
-// -------------------------------------------------------------------- needs network
-
-static AsyncServer *g_server = nullptr;
-static AsyncClient *g_accepted = nullptr;
+// ---------------------------------------------------------------------------
 
 static bool startServer() {
   g_server = new AsyncServer(TEST_PORT);
   g_server->onClient(
     [](void *, AsyncClient *c) {
-      g_accepted = c;
+      g_accepts++;
       c->onDisconnect([](void *, AsyncClient *client) {
         delete client;
       });
@@ -129,11 +143,11 @@ static bool startServer() {
 
 static void test_echo(size_t base) {
   static volatile bool got = false;
-  got = false;
+  static volatile bool connected = false;
+  got = connected = false;
+  const int accepts_before = g_accepts;
   {
     AsyncClient c;
-    static volatile bool connected = false;
-    connected = false;
     c.onConnect([](void *, AsyncClient *client) {
       connected = true;
       client->write("ping");
@@ -141,8 +155,16 @@ static void test_echo(size_t base) {
     c.onData([](void *, AsyncClient *, void *, size_t) {
       got = true;
     });
-    c.connect(WiFi.localIP(), TEST_PORT);
+    c.onError([](void *, AsyncClient *, int8_t e) {
+      Serial.printf("    (client onError %d)\n", (int)e);
+    });
+    if (!c.connect(kPeer, TEST_PORT)) {
+      Serial.println("    (connect() returned false)");
+    }
     waitFlag(got, 10000);
+    if (!got) {
+      Serial.printf("    (connected=%d accepted=%d)\n", (int)connected, g_accepts - accepts_before);
+    }
     check("7. echo round trip", got);
     c.close();
     delay(200);
@@ -162,7 +184,7 @@ static void test_close_inside_ondata(size_t base) {
       client->close();  // must ack the packet first, or the peer sees an RST
       closed = true;
     });
-    c.connect(WiFi.localIP(), TEST_PORT);
+    c.connect(kPeer, TEST_PORT);
     waitFlag(closed, 10000);
   }
   check("9. closing inside onData survives", closed);
@@ -183,8 +205,11 @@ static void test_destroy_inside_ondata(size_t base) {
     },
     c
   );
-  c->connect(WiFi.localIP(), TEST_PORT);
+  c->connect(kPeer, TEST_PORT);
   waitFlag(destroyed, 10000);
+  if (!destroyed) {
+    delete c;
+  }
   check("11. destroying the client inside onData survives", destroyed);
   check("12. ...and leaks nothing once it settles", waitClients(base, 5000));
 }
@@ -194,40 +219,45 @@ void setup() {
   delay(2000);
   Serial.println("\n\nAsyncTCP lifetime tests\n");
 
-  // Force the async task to exist so the baseline is stable
-  { AsyncClient warmup; }
-  delay(500);
-  const size_t base = asyncTcpLiveClientCount();
-  Serial.printf("baseline live clients: %u\n\n", (unsigned)base);
+  { AsyncClient warmup; }  // before LwIP is up: construction alone must not need it
+  const size_t base0 = asyncTcpLiveClientCount();
+  test_construct_destroy(base0);
 
-  test_construct_destroy(base);
-  test_connect_unroutable(base);
-  test_destroy_inside_onerror(base);
-  test_abandoned_lookup(base);
-
-  if (WIFI_SSID[0] == '\0') {
-    Serial.println("\n(no WiFi credentials set - skipping networked tests)");
-  } else {
+  // The peer is loopback, so no association is needed - but the stack still has to be
+  // running, or connect() asserts inside LOCK_TCPIP_CORE().  Credentials only affect
+  // whether the name lookup in test 6 reaches a real resolver.
+  WiFi.mode(WIFI_STA);
+  if (WIFI_SSID[0] != '\0') {
     Serial.printf("\nconnecting to %s ...\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - start) < 20000) {
       delay(250);
     }
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi failed - skipping networked tests");
-    } else {
-      Serial.printf("ip: %s\n\n", WiFi.localIP().toString().c_str());
-      if (!startServer()) {
-        Serial.println("server failed to start - skipping networked tests");
-      } else {
-        const size_t sbase = asyncTcpLiveClientCount();
-        test_echo(sbase);
-        test_close_inside_ondata(sbase);
-        test_destroy_inside_ondata(sbase);
-      }
-    }
   }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("ip: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\nnot associated - running against loopback anyway");
+  }
+  delay(500);
+
+  if (!startServer()) {
+    Serial.println("server failed to start - skipping the rest");
+    Serial.printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    return;
+  }
+  delay(500);
+
+  const size_t base = asyncTcpLiveClientCount();
+  Serial.printf("baseline live clients: %u\n\n", (unsigned)base);
+
+  test_refused_connect(base);
+  test_destroy_inside_onerror(base);
+  test_abandoned_lookup(base);
+  test_echo(base);
+  test_close_inside_ondata(base);
+  test_destroy_inside_ondata(base);
 
   Serial.printf("\n%d passed, %d failed\n", g_pass, g_fail);
 }
