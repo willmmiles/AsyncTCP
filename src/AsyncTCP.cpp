@@ -5,23 +5,7 @@
 #include "AsyncTCPLogging.h"
 #include "AsyncTCPSimpleIntrusiveList.h"
 
-#include <atomic>
-
-/*
-  The reference count wants to be lock-free: it sits on the per-event path, and a
-  FreeRTOS mutex there costs real throughput (measured at 2.3x the lock traffic per
-  request, worst on builds without CONFIG_LWIP_TCPIP_CORE_LOCKING).
-
-  Not every target this library builds for can do it.  Cortex-M0 has no exclusive-access
-  instructions, so std::atomic lowers to libatomic calls that are not linked.  Those
-  targets fall back to the queue mutex; they are single core and nowhere near the
-  throughput where the difference shows.
-*/
-#if defined(ATOMIC_INT_LOCK_FREE) && (ATOMIC_INT_LOCK_FREE == 2)
-#define ASYNCTCP_ATOMIC_REFCOUNT 1
-#else
-#define ASYNCTCP_ATOMIC_REFCOUNT 0
-#endif
+#include <memory>
 
 /**
  * LibreTiny specific configurations
@@ -144,7 +128,7 @@ typedef enum {
 struct lwip_tcp_event_packet_t {
   lwip_tcp_event_packet_t *next;
   lwip_tcp_event_t event;
-  AsyncClientImpl *impl;  // holds a reference for the life of the event
+  std::shared_ptr<AsyncClientImpl> impl;  // keeps it alive for the life of the event
   union {
     struct {
       tcp_pcb *pcb;
@@ -179,7 +163,7 @@ struct lwip_tcp_event_packet_t {
     } dns;
   };
 
-  inline lwip_tcp_event_packet_t(lwip_tcp_event_t _event, AsyncClientImpl *_impl) : next(nullptr), event(_event), impl(_impl){};
+  inline lwip_tcp_event_packet_t(lwip_tcp_event_t _event, std::shared_ptr<AsyncClientImpl> _impl) : next(nullptr), event(_event), impl(std::move(_impl)){};
 };
 
 // Detail class for interacting with AsyncClient internals, but without exposing the API
@@ -262,7 +246,7 @@ static TaskHandle_t _async_service_task_handle = NULL;
   _facade is nulled when the application's object goes away.  Dispatch is gated on it,
   so a detached implementation runs no user code and simply drains.
 */
-class AsyncClientImpl {
+class AsyncClientImpl : public std::enable_shared_from_this<AsyncClientImpl> {
 public:
   explicit AsyncClientImpl(AsyncClient *facade);
   ~AsyncClientImpl();
@@ -271,11 +255,16 @@ public:
   AsyncClientImpl &operator=(const AsyncClientImpl &) = delete;
 
   AsyncClient *_facade;  // nulled once the application's object is destroyed
-#if ASYNCTCP_ATOMIC_REFCOUNT
-  std::atomic<uint32_t> _refcount;
-#else
-  uint32_t _refcount;  // guarded by _async_queue_mutex
-#endif
+
+  /*
+    LwIP takes a plain void* for its callback argument and cannot hold a shared_ptr, so
+    instead we hold one to ourselves for exactly as long as LwIP points at us.  The
+    cycle is deliberate and always broken explicitly: by _reset_tcp_callbacks(), or by
+    tcp_error() when LwIP frees the pcb out from under us.  Same for a lookup, which
+    LwIP has no way to cancel.
+  */
+  std::shared_ptr<AsyncClientImpl> _lwip_ref;
+  std::shared_ptr<AsyncClientImpl> _dns_ref;
 
   tcp_pcb *_pcb;
 
@@ -381,64 +370,13 @@ public:
   void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
 };
 
-#if ASYNCTCP_ATOMIC_REFCOUNT
-static std::atomic<size_t> _impl_live_count{0};
-#else
+// Diagnostic only, and touched once per connection rather than per event, so taking
+// the queue mutex here costs nothing that matters.
 static size_t _impl_live_count = 0;
-#endif
 
 size_t asyncTcpLiveClientCount() {
-#if ASYNCTCP_ATOMIC_REFCOUNT
-  return _impl_live_count.load(std::memory_order_relaxed);
-#else
   queue_mutex_guard guard;
   return _impl_live_count;
-#endif
-}
-
-/*
-  Reference counting is lock-free.
-
-  An earlier version guarded the count with _async_queue_mutex, on the grounds that
-  every cross-thread handoff already passes through it.  That was true but expensive:
-  it put a FreeRTOS mutex on the per-event path and more than doubled the lock traffic
-  per request.  It costs most on builds without CONFIG_LWIP_TCPIP_CORE_LOCKING, where
-  the async task blocks in the LwIP mailbox on every api call while the LwIP thread -
-  at a much higher priority - contends for the same mutex.
-
-  _facade still needs the queue mutex, because clearing it has to interlock with the
-  enqueue in tcp_dns_found().  Only the count moves.
-*/
-static inline void _impl_ref(AsyncClientImpl *impl) {
-  if (!impl) {
-    return;
-  }
-#if ASYNCTCP_ATOMIC_REFCOUNT
-  impl->_refcount.fetch_add(1, std::memory_order_relaxed);
-#else
-  queue_mutex_guard guard;
-  ++impl->_refcount;
-#endif
-}
-
-static void _impl_unref(AsyncClientImpl *impl) {
-  if (!impl) {
-    return;
-  }
-#if ASYNCTCP_ATOMIC_REFCOUNT
-  // acq_rel so everything the releasing thread wrote is visible to whoever destroys it
-  const bool last = (impl->_refcount.fetch_sub(1, std::memory_order_acq_rel) == 1);
-#else
-  bool last;
-  {
-    queue_mutex_guard guard;
-    last = (--impl->_refcount == 0);
-  }
-#endif
-  // Destroy outside any lock: nothing else can reach it at zero.
-  if (last) {
-    delete impl;
-  }
 }
 
 static uint32_t _xor_shift_state = 31;  // any nonzero seed will do
@@ -454,9 +392,7 @@ static void _free_event(lwip_tcp_event_packet_t *evpkt) {
   if ((evpkt->event == LWIP_TCP_RECV) && (evpkt->recv.pb != nullptr)) {
     pbuf_free(evpkt->recv.pb);
   }
-  AsyncClientImpl *impl = evpkt->impl;
-  delete evpkt;
-  _impl_unref(impl);  // the event no longer refers to it
+  delete evpkt;  // releases the event's reference to the implementation
 }
 
 static inline void _send_async_event(lwip_tcp_event_packet_t *e) {
@@ -542,7 +478,7 @@ static size_t _remove_events_for_client(AsyncClientImpl *client) {
   {
     queue_mutex_guard guard;
     removed_event_chain = _async_queue.remove_if([=](lwip_tcp_event_packet_t &pkt) {
-      return pkt.impl == client;
+      return pkt.impl.get() == client;
     });
   }
 
@@ -686,10 +622,8 @@ static bool _start_async_task() {
  * LwIP Callbacks
  * */
 
-// LwIP now holds a pointer to the implementation, so it takes a reference.  Dropped by
-// _reset_tcp_callbacks(), or by tcp_error() when LwIP frees the pcb out from under us.
 static void _bind_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
-  _impl_ref(client);
+  client->_lwip_ref = client->shared_from_this();
   tcp_arg(pcb, client);
   tcp_recv(pcb, &AsyncTCP_detail::tcp_recv);
   tcp_sent(pcb, &AsyncTCP_detail::tcp_sent);
@@ -705,14 +639,14 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
   tcp_poll(pcb, NULL, 0);
   if (client) {
     _remove_events_for_client(client);
-    _impl_unref(client);  // LwIP no longer points at us
+    client->_lwip_ref.reset();  // LwIP no longer points at us
   }
 }
 
 static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   // ets_printf("+C: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_CONNECTED, client};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_CONNECTED, client->shared_from_this()};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
@@ -720,7 +654,6 @@ static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   e->connected.pcb = pcb;
   e->connected.err = err;
   queue_mutex_guard guard;
-  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -738,7 +671,7 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
 
   // ets_printf("+P: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_POLL, client};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_POLL, client->shared_from_this()};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
@@ -746,14 +679,13 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
   e->poll.pcb = pcb;
 
   queue_mutex_guard guard;
-  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
 
 int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_RECV, client};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_RECV, client->shared_from_this()};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
@@ -771,7 +703,6 @@ int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb
   }
 
   queue_mutex_guard guard;
-  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -779,7 +710,7 @@ int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb
 int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   // ets_printf("+S: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_SENT, client};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_SENT, client->shared_from_this()};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
@@ -788,7 +719,6 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   e->sent.len = len;
 
   queue_mutex_guard guard;
-  _impl_ref(client);
   _send_async_event(e);
   return ERR_OK;
 }
@@ -807,10 +737,8 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   _remove_events_for_client(client);
 
   // enqueue event to be processed in the async task for the user callback
-  _impl_ref(client);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ERROR, client};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ERROR, client->shared_from_this()};
   if (!e) {
-    _impl_unref(client);  // the event never took the reference
     async_tcp_log_e("Failed to allocate event packet");
   } else {
     e->error.err = err;
@@ -821,7 +749,7 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
     client->_pcb = nullptr;
     _send_async_event(e);  // no-op if the allocation failed
   }
-  _impl_unref(client);  // LwIP has freed the pcb and no longer points at us
+  client->_lwip_ref.reset();  // LwIP has freed the pcb and no longer points at us
 }
 
 void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg) {
@@ -837,14 +765,12 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
   }
   if (!wanted) {
     // close() or abort() gave up on this lookup while it was in flight
-    _impl_unref(client);
+    client->_dns_ref.reset();
     return;
   }
 
-  _impl_ref(client);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client->shared_from_this()};
   if (!e) {
-    _impl_unref(client);  // the event never took the reference
     async_tcp_log_e("Failed to allocate event packet");
   } else {
     e->dns.port = client->_connect_port;
@@ -860,7 +786,7 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
     queue_mutex_guard guard;
     _send_async_event(e);  // no-op if the allocation failed
   }
-  _impl_unref(client);  // LwIP is done with the lookup
+  client->_dns_ref.reset();  // LwIP is done with the lookup
 }
 
 /*
@@ -1111,16 +1037,12 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
  */
 
 AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
-  : _facade(facade), _refcount(1), _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0),
-    _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0),
-    _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME),
-    _connect_port(0), _dns_pending(false), _in_callback_ack_len(0) {
-#if ASYNCTCP_ATOMIC_REFCOUNT
-  _impl_live_count.fetch_add(1, std::memory_order_relaxed);
-#else
+  : _facade(facade), _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0),
+    _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true),
+    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0),
+    _dns_pending(false), _in_callback_ack_len(0) {
   queue_mutex_guard guard;
   ++_impl_live_count;
-#endif
 }
 
 AsyncClientImpl::~AsyncClientImpl() {
@@ -1130,15 +1052,11 @@ AsyncClientImpl::~AsyncClientImpl() {
   if (_pcb) {
     async_tcp_log_e("implementation destroyed with a live pcb");
   }
-#if ASYNCTCP_ATOMIC_REFCOUNT
-  _impl_live_count.fetch_sub(1, std::memory_order_relaxed);
-#else
   queue_mutex_guard guard;
   --_impl_live_count;
-#endif
 }
 
-AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(new AsyncClientImpl(this)) {
+AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>(this)) {
   if (pcb) {
     _impl->_adopt(pcb);
   }
@@ -1154,8 +1072,7 @@ AsyncClient::~AsyncClient() {
     queue_mutex_guard guard;
     _impl->_facade = nullptr;
   }
-  _impl_unref(_impl);
-  _impl = nullptr;
+  _impl.reset();
 }
 
 /*
@@ -1208,9 +1125,9 @@ bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
   if (_tcp_connect(&_pcb, &addr, port, (tcp_connected_fn)&_tcp_connected) == ESP_OK) {
     return true;
   }
-  // _pcb is now NULL and the api call cleared tcp_arg(), so release the reference
-  // _adopt() handed to LwIP.  No callbacks are raised: we are returning failure.
-  _impl_unref(this);
+  // _pcb is now NULL and the api call cleared tcp_arg(), so release the self-reference
+  // _adopt() took.  No callbacks are raised: we are returning failure.
+  _lwip_ref.reset();
   async_tcp_log_d("connect failed");
   return false;
 }
@@ -1264,7 +1181,7 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
   // LwIP keeps the argument until the callback fires, so hand it a reference.  It calls
   // back if and only if it returns ERR_INPROGRESS - always exactly once, including on
   // timeout - so the reference is never stranded.
-  _impl_ref(this);
+  _dns_ref = shared_from_this();
   err_t err;
   {
     tcp_core_guard tcg;
@@ -1276,7 +1193,7 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
     _dns_pending = true;
     return true;  // the reference now belongs to LwIP
   }
-  _impl_unref(this);  // no callback will arrive; the caller still holds a reference
+  _dns_ref.reset();  // no callback will arrive
 
   if (err == ERR_OK) {
 #if ESP_IDF_VERSION_MAJOR < 5
@@ -2229,7 +2146,6 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
     if (c && c->pcb()) {
       c->setNoDelay(server->_noDelay);
 
-      _impl_ref(c->_impl);
       lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ACCEPT, c->_impl};
       if (e) {
         e->accept.server = server;
@@ -2241,8 +2157,7 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
 
       // Couldn't allocate accept event.  Reset the callbacks first: tcp_abort() raises
       // the error callback, and this client is being discarded, not reported on.
-      _impl_unref(c->_impl);  // the event never took the reference
-      _reset_tcp_callbacks(pcb, c->_impl);
+      _reset_tcp_callbacks(pcb, c->_impl.get());
       // Clear the pcb before destroying c - we're on the LwIP thread, and letting it
       // call in to close would deadlock trying to RPC to itself
       c->_impl->_pcb = nullptr;
