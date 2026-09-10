@@ -1609,10 +1609,14 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
         return ERR_OK;  // success
       }
 
-      // Couldn't allocate accept event
-      // We can't let the client object call in to close, as we're on the LWIP thread; it could deadlock trying to RPC to itself
+      // Couldn't allocate accept event.  Reset the callbacks first: tcp_abort() raises
+      // the error callback, and this client is being discarded, not reported on.
+      _reset_tcp_callbacks(pcb, c);
+      // Clear the pcb before destroying c - we're on the LwIP thread, and letting it
+      // call in to close would deadlock trying to RPC to itself
       c->_pcb = nullptr;
       tcp_abort(pcb);
+      delete c;
       async_tcp_log_e("_accept failed: couldn't accept client");
       return ERR_ABRT;
     }
