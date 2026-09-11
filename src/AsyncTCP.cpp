@@ -1298,6 +1298,10 @@ void AsyncClientImpl::ackPacket(struct pbuf *pb) {
   pbuf_free(pb);
 }
 
+void AsyncClientImpl::ackLater() {
+  _ack_pcb = false;
+}
+
 /*
  * Main Private Methods
  * */
