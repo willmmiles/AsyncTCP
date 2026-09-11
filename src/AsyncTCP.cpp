@@ -253,11 +253,9 @@ public:
     LwIP takes a plain void* for its callback argument and cannot hold a shared_ptr, so
     instead we hold one to ourselves for exactly as long as LwIP points at us.  The
     cycle is deliberate and always broken explicitly: by _reset_tcp_callbacks(), or by
-    tcp_error() when LwIP frees the pcb out from under us.  Same for a lookup, which
-    LwIP has no way to cancel.
+    tcp_error() when LwIP frees the pcb out from under us.
   */
   std::shared_ptr<AsyncClientImpl> _lwip_ref;
-  std::shared_ptr<AsyncClientImpl> _dns_ref;
 
   tcp_pcb *_pcb;
 
@@ -740,7 +738,15 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
   // ets_printf("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
   // 'name' points into LwIP's DNS table, which the next lookup recycles; don't keep it.
   (void)name;
-  auto client = reinterpret_cast<AsyncClientImpl *>(arg);
+  // LwIP cannot cancel a lookup, but it does promise exactly one callback, so the
+  // context is ours to destroy here.  It is a weak reference: an AsyncClient that goes
+  // away mid-lookup is not kept alive waiting for an answer nobody wants.
+  std::unique_ptr<std::weak_ptr<AsyncClientImpl>> callback_state(reinterpret_cast<std::weak_ptr<AsyncClientImpl> *>(arg));
+  auto client = callback_state->lock();
+  if (!client) {
+    return;  // the implementation was destroyed while the lookup was in flight
+  }
+
   bool wanted;
   {
     queue_mutex_guard guard;
@@ -748,12 +754,10 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
     client->_dns_pending = false;
   }
   if (!wanted) {
-    // close() or abort() gave up on this lookup while it was in flight
-    client->_dns_ref.reset();
-    return;
+    return;  // close() or abort() gave up on this lookup while it was in flight
   }
 
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client->shared_from_this()};
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
   } else {
@@ -766,11 +770,8 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
     }
   }
 
-  {
-    queue_mutex_guard guard;
-    _send_async_event(e);  // no-op if the allocation failed
-  }
-  client->_dns_ref.reset();  // LwIP is done with the lookup
+  queue_mutex_guard guard;
+  _send_async_event(e);  // no-op if the allocation failed
 }
 
 /*
@@ -1158,22 +1159,28 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
     return false;
   }
 
-  // LwIP keeps the argument until the callback fires, so hand it a reference.  It calls
-  // back if and only if it returns ERR_INPROGRESS - always exactly once, including on
-  // timeout - so the reference is never stranded.
-  _dns_ref = shared_from_this();
+  // LwIP keeps the argument until the callback fires, and calls back if and only if it
+  // returns ERR_INPROGRESS - always exactly once, including on timeout.  So ownership
+  // of the context transfers there and nowhere else; every other return frees it by
+  // leaving this scope.
+  std::unique_ptr<std::weak_ptr<AsyncClientImpl>> callback_state(new (std::nothrow) std::weak_ptr<AsyncClientImpl>(shared_from_this()));
+  if (!callback_state) {
+    async_tcp_log_e("Failed to allocate the lookup context");
+    return false;
+  }
+
   err_t err;
   {
     tcp_core_guard tcg;
-    err = dns_gethostbyname(host, &addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, this);
+    err = dns_gethostbyname(host, &addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, callback_state.get());
   }
 
   if (err == ERR_INPROGRESS) {
     _connect_port = port;
     _dns_pending = true;
-    return true;  // the reference now belongs to LwIP
+    callback_state.release();  // now LwIP's to destroy
+    return true;
   }
-  _dns_ref.reset();  // no callback will arrive
 
   if (err == ERR_OK) {
 #if ESP_IDF_VERSION_MAJOR < 5
