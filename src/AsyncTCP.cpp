@@ -5,6 +5,7 @@
 #include "AsyncTCPLogging.h"
 #include "AsyncTCPSimpleIntrusiveList.h"
 
+#include <cassert>
 #include <memory>
 
 /**
@@ -1024,13 +1025,11 @@ AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
     _dns_pending(false), _in_callback_ack_len(0) {}
 
 AsyncClientImpl::~AsyncClientImpl() {
-  // Every path that drops the last reference clears the binding first, so arriving here
-  // with a pcb still attached means LwIP is left pointing at freed memory.  Closing it
-  // here is not the fix: that would RPC to the LwIP thread from whichever thread dropped
-  // the last reference, possibly the LwIP thread itself.
-  if (_pcb) {
-    async_tcp_log_e("implementation destroyed with a live pcb");
-  }
+  // Every path that drops the last reference clears the binding first, so a pcb still
+  // attached here means LwIP is left pointing at freed memory.  Closing it now would be
+  // no fix: that would RPC to the LwIP thread from whichever thread dropped the last
+  // reference, possibly the LwIP thread itself.
+  assert(!_pcb);
 }
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>(this)) {
