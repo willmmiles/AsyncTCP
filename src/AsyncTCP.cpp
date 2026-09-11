@@ -184,6 +184,20 @@ namespace {
 
 static SemaphoreHandle_t _async_queue_mutex = nullptr;
 
+// The queue is only reachable through an AsyncClient or an AsyncServer, so creating the
+// mutex in their constructors puts it ahead of every user.  Unsynchronized, in the same
+// way _start_async_task() always has been: the first of those can only be constructed by
+// application code, before the async task exists and before LwIP points at anything.
+static bool _init_queue_mutex() {
+  if (!_async_queue_mutex) {
+    _async_queue_mutex = xSemaphoreCreateMutex();
+    if (!_async_queue_mutex) {
+      async_tcp_log_e("Failed to create the queue mutex");
+    }
+  }
+  return _async_queue_mutex != nullptr;
+}
+
 class queue_mutex_guard {
   bool holds_mutex;
 
@@ -590,11 +604,8 @@ static bool customTaskCreateUniversal(
 }
 
 static bool _start_async_task() {
-  if (!_async_queue_mutex) {
-    _async_queue_mutex = xSemaphoreCreateMutex();
-    if (!_async_queue_mutex) {
-      return false;
-    }
+  if (!_init_queue_mutex()) {
+    return false;
   }
 
   if (!_async_service_task_handle) {
@@ -1056,6 +1067,7 @@ AsyncClientImpl::~AsyncClientImpl() {
 }
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(new AsyncClientImpl(this)) {
+  _init_queue_mutex();
   if (pcb) {
     _impl->_adopt(pcb);
   }
@@ -2024,10 +2036,13 @@ void AsyncClient::onPoll(AcConnectHandler cb, void *arg) {
  */
 
 AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port)
-  : _port(port), _addr(addr), _noDelay(false), _pcb(nullptr), _connect_cb(nullptr), _connect_cb_arg(nullptr) {}
+  : _port(port), _addr(addr), _noDelay(false), _pcb(nullptr), _connect_cb(nullptr), _connect_cb_arg(nullptr) {
+  _init_queue_mutex();
+}
 
 #ifdef ARDUINO
 AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
+  _init_queue_mutex();
 #if ESP_IDF_VERSION_MAJOR < 5
 #if LWIP_IPV4 && LWIP_IPV6
   _addr.type = IPADDR_TYPE_V4;
@@ -2041,6 +2056,7 @@ AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(
 }
 #if ESP_IDF_VERSION_MAJOR < 5 && __has_include(<IPv6Address.h>) && LWIP_IPV6
 AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
+  _init_queue_mutex();
 #if LWIP_IPV4 && LWIP_IPV6
   _addr.type = IPADDR_TYPE_V6;
 #endif
@@ -2051,6 +2067,7 @@ AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDela
 #endif
 
 AsyncServer::AsyncServer(uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
+  _init_queue_mutex();
 #if LWIP_IPV4 && LWIP_IPV6
   _addr.type = IPADDR_TYPE_ANY;
   _addr.u_addr.ip4.addr = INADDR_ANY;
