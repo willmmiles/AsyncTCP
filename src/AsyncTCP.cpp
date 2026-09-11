@@ -249,14 +249,6 @@ public:
 
   AsyncClient *_facade;  // nulled once the application's object is destroyed
 
-  /*
-    LwIP takes a plain void* for its callback argument and cannot hold a shared_ptr, so
-    instead we hold one to ourselves for exactly as long as LwIP points at us.  The
-    cycle is deliberate and always broken explicitly: by _reset_tcp_callbacks(), or by
-    tcp_error() when LwIP frees the pcb out from under us.
-  */
-  std::shared_ptr<AsyncClientImpl> _lwip_ref;
-
   tcp_pcb *_pcb;
 
   AcConnectHandler _connect_cb;
@@ -604,8 +596,11 @@ static bool _start_async_task() {
  * LwIP Callbacks
  * */
 
+// The binding is the implementation's own state: _pcb is non-null for exactly as long
+// as LwIP points at us, so nothing else has to track it.  What keeps the implementation
+// alive while it is bound is that ~AsyncClient() must close() first, and close() is an
+// api call - it cannot run concurrently with a callback.
 static void _bind_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
-  client->_lwip_ref = client->shared_from_this();
   tcp_arg(pcb, client);
   tcp_recv(pcb, &AsyncTCP_detail::tcp_recv);
   tcp_sent(pcb, &AsyncTCP_detail::tcp_sent);
@@ -621,7 +616,6 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
   tcp_poll(pcb, NULL, 0);
   if (client) {
     _remove_events_for_client(client);
-    client->_lwip_ref.reset();  // LwIP no longer points at us
   }
 }
 
@@ -731,7 +725,9 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
     client->_pcb = nullptr;
     _send_async_event(e);  // no-op if the allocation failed
   }
-  client->_lwip_ref.reset();  // LwIP has freed the pcb and no longer points at us
+  // Nothing may touch the client past this point.  Clearing _pcb above released the
+  // binding, so ~AsyncClient() is free to drop the last reference as soon as it reads
+  // _pcb as null - and it can only reach that read through the mutex just released.
 }
 
 void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg) {
@@ -1028,9 +1024,10 @@ AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
     _dns_pending(false), _in_callback_ack_len(0) {}
 
 AsyncClientImpl::~AsyncClientImpl() {
-  // A bound pcb holds a reference of its own, so the count cannot reach zero while one
-  // is still attached.  If it ever does, closing here would RPC to the LwIP thread from
-  // whichever thread dropped the last reference - possibly the LwIP thread itself.
+  // Every path that drops the last reference clears the binding first, so arriving here
+  // with a pcb still attached means LwIP is left pointing at freed memory.  Closing it
+  // here is not the fix: that would RPC to the LwIP thread from whichever thread dropped
+  // the last reference, possibly the LwIP thread itself.
   if (_pcb) {
     async_tcp_log_e("implementation destroyed with a live pcb");
   }
@@ -1106,9 +1103,8 @@ bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
   if (_tcp_connect(&_pcb, &addr, port, (tcp_connected_fn)&_tcp_connected) == ESP_OK) {
     return true;
   }
-  // _pcb is now NULL and the api call cleared tcp_arg(), so release the self-reference
-  // _adopt() took.  No callbacks are raised: we are returning failure.
-  _lwip_ref.reset();
+  // _pcb is now NULL and the api call cleared tcp_arg(), so the binding is gone.  No
+  // callbacks are raised: we are returning failure.
   async_tcp_log_d("connect failed");
   return false;
 }
