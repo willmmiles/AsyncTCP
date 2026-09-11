@@ -1278,6 +1278,10 @@ void AsyncClientImpl::ackPacket(struct pbuf *pb) {
   pbuf_free(pb);
 }
 
+void AsyncClientImpl::ackLater() {
+  _ack_pcb = false;
+}
+
 /*
  * Main Private Methods
  * */
@@ -1286,19 +1290,15 @@ void AsyncClientImpl::ackPacket(struct pbuf *pb) {
  * Private Callbacks
  * */
 
-// Adopt a pcb and reset all per-connection state.  Callers must already be
-// serialized against the LwIP core (accept callback, or tcp_core_guard).
 // LwIP has no way to cancel a lookup, so record that we no longer want the answer.
 // tcp_dns_found() drops it and releases LwIP's reference when it eventually fires.
-void AsyncClientImpl::ackLater() {
-  _ack_pcb = false;
-}
-
 void AsyncClientImpl::_abandonResolve() {
   queue_mutex_guard guard;
   _dns_pending = false;
 }
 
+// Adopt a pcb and reset all per-connection state.  Callers must already be
+// serialized against the LwIP core (accept callback, or tcp_core_guard).
 void AsyncClientImpl::_adopt(tcp_pcb *pcb) {
   _pcb = pcb;
   _rx_ack_len = 0;
