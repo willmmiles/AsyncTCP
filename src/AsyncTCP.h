@@ -17,6 +17,7 @@
 #include "lwip/ip6_addr.h"
 #include "lwip/ip_addr.h"
 #include <functional>
+#include <memory>
 
 #ifndef LIBRETINY
 #include "sdkconfig.h"
@@ -274,7 +275,7 @@ protected:
   // any outstanding name lookup all hold a reference.  That keeps the callbacks
   // themselves alive for the duration of a call, so destroying an AsyncClient from
   // inside one of its own callbacks is safe.
-  AsyncClientImpl *_impl;
+  std::shared_ptr<AsyncClientImpl> _impl;
 };
 
 class AsyncServer {
