@@ -2,8 +2,8 @@
 //
 // These exercise the object-lifetime paths that are hard to reach from ordinary use:
 // destroying a client from inside its own callbacks, abandoning a name lookup, and
-// connections that fail.  Each test finishes by waiting for asyncTcpLiveClientCount()
-// to settle back to its baseline, which is what catches a leaked reference.
+// connections that fail.  Each test finishes by waiting for its LiveProbe to report
+// the client's implementation released, which is what catches a leaked reference.
 //
 // Everything past the first test needs the TCP/IP stack running - connect() takes the
 // LwIP core lock, which does not exist until then - and the peer for most of them is a
@@ -16,6 +16,48 @@
 #include <Arduino.h>
 #include <AsyncTCP.h>
 #include <WiFi.h>
+#include <memory>
+
+/*
+  Answers "has this client's implementation been released yet?" without the library
+  carrying a counter for it.  The callbacks live in the implementation, so a shared_ptr
+  captured by one of them is released at exactly the moment the implementation is, and
+  a weak_ptr to it then expires.
+
+  The wait is a member rather than a free function: the .ino preprocessor hoists
+  prototypes above this class, so a free function taking a LiveProbe would not compile.
+
+  It rides in onTimeout, which none of these tests use.
+*/
+class LiveProbe {
+public:
+  void attach(AsyncClient &c) {
+    auto tag = std::make_shared<int>(0);
+    _weak = tag;
+    c.onTimeout([tag](void *, AsyncClient *, uint32_t) {});
+  }
+
+  bool alive() const {
+    return !_weak.expired();
+  }
+
+  // A queued event or an outstanding lookup can still hold a reference, so give it
+  // time to drain rather than sampling the moment the client goes out of scope.
+  bool waitReleased(uint32_t timeout_ms) const {
+    uint32_t start = millis();
+    while ((millis() - start) < timeout_ms) {
+      if (_weak.expired()) {
+        return true;
+      }
+      delay(10);
+    }
+    Serial.println("    (implementation still referenced)");
+    return false;
+  }
+
+private:
+  std::weak_ptr<int> _weak;
+};
 
 static const char *WIFI_SSID = "";  // only affects test 6; the peer is loopback
 static const char *WIFI_PASS = "";
@@ -43,37 +85,30 @@ static bool waitFlag(volatile bool &flag, uint32_t timeout_ms) {
   return flag;
 }
 
-// The count only settles once every queued event referencing a destroyed client has
-// drained, so give it a moment rather than sampling immediately.
-static bool waitClients(size_t expected, uint32_t timeout_ms) {
-  uint32_t start = millis();
-  while ((millis() - start) < timeout_ms) {
-    if (asyncTcpLiveClientCount() == expected) {
-      return true;
-    }
-    delay(10);
-  }
-  Serial.printf("    (live clients: %u, expected %u)\n", (unsigned)asyncTcpLiveClientCount(), (unsigned)expected);
-  return false;
-}
-
 static AsyncServer *g_server = nullptr;
 static volatile int g_accepts = 0;
 
 // ---------------------------------------------------------------------------
 
-static void test_construct_destroy(size_t base) {
-  { AsyncClient c; }
-  check("1. construct and destroy leaks nothing", waitClients(base, 1000));
+static void test_construct_destroy() {
+  LiveProbe probe;
+  {
+    AsyncClient c;
+    probe.attach(c);
+    probe.attach(c);
+  }
+  check("1. construct and destroy leaks nothing", probe.waitReleased(1000));
 }
 
 // A closed port on our own address gives us a prompt RST, which is a far more
 // deterministic error than waiting out a SYN timeout to an unroutable address.
-static void test_refused_connect(size_t base) {
+static void test_refused_connect() {
+  LiveProbe probe;
   static volatile bool errored = false;
   errored = false;
   {
     AsyncClient c;
+    probe.attach(c);
     c.onError([](void *, AsyncClient *, int8_t) {
       errored = true;
     });
@@ -84,13 +119,15 @@ static void test_refused_connect(size_t base) {
     waitFlag(errored, 10000);
     check("2. refused connect reports an error", started && errored);
   }
-  check("3. ...and leaks nothing once it settles", waitClients(base, 5000));
+  check("3. ...and leaks nothing once it settles", probe.waitReleased(5000));
 }
 
-static void test_destroy_inside_onerror(size_t base) {
+static void test_destroy_inside_onerror() {
+  LiveProbe probe;
   static volatile bool errored = false;
   errored = false;
   AsyncClient *c = new AsyncClient();
+  probe.attach(*c);
   // The dangerous case: the std::function being executed belongs to this object
   c->onError(
     [](void *arg, AsyncClient *, int8_t) {
@@ -107,18 +144,20 @@ static void test_destroy_inside_onerror(size_t base) {
     delete c;  // the callback never ran, so it is still ours to release
   }
   check("4. destroying the client inside onError survives", started && errored);
-  check("5. ...and leaks nothing once it settles", waitClients(base, 5000));
+  check("5. ...and leaks nothing once it settles", probe.waitReleased(5000));
 }
 
-static void test_abandoned_lookup(size_t base) {
+static void test_abandoned_lookup() {
+  LiveProbe probe;
   {
     AsyncClient c;
+    probe.attach(c);
     bool started = c.connect("test-host-that-does-not-exist.invalid", 80);
     Serial.printf("    (lookup started: %s)\n", started ? "yes" : "no");
     c.close();  // abandon it while it may still be in flight
   }
   // LwIP cannot cancel a lookup, so the reference lives until its timeout fires
-  check("6. closing during a lookup leaks nothing (slow: DNS timeout)", waitClients(base, 45000));
+  check("6. closing during a lookup leaks nothing (slow: DNS timeout)", probe.waitReleased(45000));
 }
 
 // ---------------------------------------------------------------------------
@@ -141,13 +180,15 @@ static bool startServer() {
   return g_server->status() != 0;
 }
 
-static void test_echo(size_t base) {
+static void test_echo() {
+  LiveProbe probe;
   static volatile bool got = false;
   static volatile bool connected = false;
   got = connected = false;
   const int accepts_before = g_accepts;
   {
     AsyncClient c;
+    probe.attach(c);
     c.onConnect([](void *, AsyncClient *client) {
       connected = true;
       client->write("ping");
@@ -169,14 +210,16 @@ static void test_echo(size_t base) {
     c.close();
     delay(200);
   }
-  check("8. echo client leaks nothing", waitClients(base, 5000));
+  check("8. echo client leaks nothing", probe.waitReleased(5000));
 }
 
-static void test_close_inside_ondata(size_t base) {
+static void test_close_inside_ondata() {
+  LiveProbe probe;
   static volatile bool closed = false;
   closed = false;
   {
     AsyncClient c;
+    probe.attach(c);
     c.onConnect([](void *, AsyncClient *client) {
       client->write("ping");
     });
@@ -188,13 +231,15 @@ static void test_close_inside_ondata(size_t base) {
     waitFlag(closed, 10000);
   }
   check("9. closing inside onData survives", closed);
-  check("10. ...and leaks nothing once it settles", waitClients(base, 5000));
+  check("10. ...and leaks nothing once it settles", probe.waitReleased(5000));
 }
 
-static void test_destroy_inside_ondata(size_t base) {
+static void test_destroy_inside_ondata() {
+  LiveProbe probe;
   static volatile bool destroyed = false;
   destroyed = false;
   AsyncClient *c = new AsyncClient();
+  probe.attach(*c);
   c->onConnect([](void *, AsyncClient *client) {
     client->write("ping");
   });
@@ -211,7 +256,7 @@ static void test_destroy_inside_ondata(size_t base) {
     delete c;
   }
   check("11. destroying the client inside onData survives", destroyed);
-  check("12. ...and leaks nothing once it settles", waitClients(base, 5000));
+  check("12. ...and leaks nothing once it settles", probe.waitReleased(5000));
 }
 
 void setup() {
@@ -219,9 +264,7 @@ void setup() {
   delay(2000);
   Serial.println("\n\nAsyncTCP lifetime tests\n");
 
-  { AsyncClient warmup; }  // before LwIP is up: construction alone must not need it
-  const size_t base0 = asyncTcpLiveClientCount();
-  test_construct_destroy(base0);
+  test_construct_destroy();  // before LwIP is up: construction alone must not need it
 
   // The peer is loopback, so no association is needed - but the stack still has to be
   // running, or connect() asserts inside LOCK_TCPIP_CORE().  Credentials only affect
@@ -249,15 +292,12 @@ void setup() {
   }
   delay(500);
 
-  const size_t base = asyncTcpLiveClientCount();
-  Serial.printf("baseline live clients: %u\n\n", (unsigned)base);
-
-  test_refused_connect(base);
-  test_destroy_inside_onerror(base);
-  test_abandoned_lookup(base);
-  test_echo(base);
-  test_close_inside_ondata(base);
-  test_destroy_inside_ondata(base);
+  test_refused_connect();
+  test_destroy_inside_onerror();
+  test_abandoned_lookup();
+  test_echo();
+  test_close_inside_ondata();
+  test_destroy_inside_ondata();
 
   Serial.printf("\n%d passed, %d failed\n", g_pass, g_fail);
 }
