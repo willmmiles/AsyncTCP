@@ -1050,7 +1050,6 @@ AsyncClient::~AsyncClient() {
     queue_mutex_guard guard;
     _impl->_facade = nullptr;
   }
-  _impl.reset();
 }
 
 /*
