@@ -133,8 +133,7 @@ typedef enum {
   LWIP_TCP_ERROR,
   LWIP_TCP_POLL,
   LWIP_TCP_ACCEPT,
-  LWIP_TCP_CONNECTED,
-  LWIP_TCP_DNS
+  LWIP_TCP_CONNECTED
 } lwip_tcp_event_t;
 
 struct lwip_tcp_event_packet_t {
@@ -168,11 +167,6 @@ struct lwip_tcp_event_packet_t {
     struct {
       AsyncServer *server;
     } accept;
-    struct {
-      ip_addr_t addr;
-      uint16_t port;
-      bool resolved;
-    } dns;
   };
 
   inline lwip_tcp_event_packet_t(lwip_tcp_event_t _event, std::shared_ptr<AsyncClientImpl> _impl) : next(nullptr), event(_event), impl(std::move(_impl)){};
@@ -258,9 +252,21 @@ public:
   AsyncClientImpl(const AsyncClientImpl &) = delete;
   AsyncClientImpl &operator=(const AsyncClientImpl &) = delete;
 
-  AsyncClient *_facade;  // nulled once the application's object is destroyed
+  /*
+    Members held under LwIP context
 
+  */
   tcp_pcb *_pcb;
+  uint16_t _connect_port;
+  std::weak_ptr<AsyncClientImpl> *_dns_token;  // non-owning pointer to the most recent DNS lookup token
+
+  /*
+    Not synchronized.  The handlers are installed by the application before it connects
+    and read by the async task when it dispatches; the rest is connection state that the
+    async task owns in practice, touched from the calling task only through calls the
+    application is expected not to make from two tasks at once against one client.
+  */
+  AsyncClient *_facade;  // nulled once the application's object is destroyed
 
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
@@ -286,8 +292,6 @@ public:
   uint32_t _rx_timeout;
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
-  uint16_t _connect_port;
-  bool _dns_pending;              // a lookup is outstanding and holds a reference
   uint32_t _in_callback_ack_len;  // bytes handed to onData but not yet acked
 
   ASYNCTCP_ALWAYS_INLINE bool connect(ip_addr_t addr, uint16_t port);
@@ -314,7 +318,6 @@ public:
   ASYNCTCP_ALWAYS_INLINE bool disconnecting() const;
   ASYNCTCP_ALWAYS_INLINE bool disconnected() const;
   ASYNCTCP_ALWAYS_INLINE bool freeable() const;
-  void _abandonResolve();
 
   ASYNCTCP_ALWAYS_INLINE uint16_t getMss() const;
   ASYNCTCP_ALWAYS_INLINE uint32_t getRxTimeout() const;
@@ -361,7 +364,6 @@ public:
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
-  void _dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port);
 };
 
 static uint32_t _xor_shift_state = 31;  // any nonzero seed will do
@@ -535,9 +537,6 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
     // ets_printf("A: 0x%08x 0x%08x\n", e->impl, e->accept.server);
     // Gated above, so the facade is still alive
     e->accept.server->_accepted(e->impl->_facade);
-  } else if (e->event == LWIP_TCP_DNS) {
-    // ets_printf("D: 0x%08x = %s\n", e->impl, ipaddr_ntoa(&e->dns.addr));
-    e->impl->_dns_found(e->dns.resolved, &e->dns.addr, e->dns.port);
   }
   _free_event(e);
 }
@@ -615,6 +614,9 @@ static bool _start_async_task() {
  * LwIP Callbacks
  * */
 
+// Defined with the other api calls below; tcp_dns_found() dials through it directly.
+static err_t _tcp_connect_in_context(AsyncClientImpl *client, const ip_addr_t *addr, uint16_t port);
+
 // Attach an AsyncClient to a TCP PCB by setting the appropriate LwIP callbacks and argument.
 static void _bind_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
   tcp_arg(pcb, client);
@@ -632,6 +634,13 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
   tcp_poll(pcb, NULL, 0);
   if (client) {
     _remove_events_for_client(client);
+  }
+}
+
+//  Stand down any outstanding name lookup.  Run in LwIP context to ensure atomicity with the tcp_dns_found() callback.
+static void _abandon_resolve(AsyncClientImpl *client) {
+  if (client) {
+    client->_dns_token = nullptr;
   }
 }
 
@@ -759,31 +768,36 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
     return;  // the implementation was destroyed while the lookup was in flight
   }
 
-  bool wanted;
-  {
-    queue_mutex_guard guard;
-    wanted = client->_dns_pending;
-    client->_dns_pending = false;
+  // Validate that we're the most recent DNS lookup for this client.
+  if (client->_dns_token != callback_state.get()) {
+    return;  // close(), abort() or a newer lookup superseded this query
   }
-  if (!wanted) {
-    return;  // close() or abort() gave up on this lookup while it was in flight
+  const uint16_t port = client->_connect_port;
+  client->_dns_token = nullptr;  // lookup complete
+
+  // Check that client isn't already open?
+  if (client->_pcb) {
+    return;  // connected by some other route while we were resolving
   }
 
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_DNS, client};
+  // Treat any-address or blocklist responses as failed lookups.
+  const bool resolved = (ipaddr != nullptr) && !ip_addr_isany_val(*ipaddr);
+
+  // Start the connection right away; we're already in LwIP context
+  if (resolved && _tcp_connect_in_context(client.get(), ipaddr, port) == ERR_OK) {
+    return;
+  }
+
+  // The original DNS-based connect() reported "success" to the caller, so we must notify
+  // them of the failure.  Queue an error event packet.
+  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ERROR, client};
   if (!e) {
     async_tcp_log_e("Failed to allocate event packet");
-  } else {
-    e->dns.port = client->_connect_port;
-    e->dns.resolved = (ipaddr != nullptr);
-    if (ipaddr) {
-      memcpy(&e->dns.addr, ipaddr, sizeof(ip_addr_t));
-    } else {
-      memset(&e->dns.addr, 0, sizeof(e->dns.addr));
-    }
+    return;
   }
-
+  e->error.err = resolved ? ERR_CONN : -55;
   queue_mutex_guard guard;
-  _send_async_event(e);  // no-op if the allocation failed
+  _send_async_event(e);
 }
 
 /*
@@ -793,14 +807,12 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
 #include "lwip/priv/tcpip_priv.h"
 
 /*
-  One transaction's arguments.  The client-side calls address the pcb through `client`,
-  which is the only thing that knows which pcb is current; `pcb` is for the server, whose
-  listening socket is not owned by an implementation object.
+  Context structure for `tcpip_api_call`, ie. code running in LwIP context.
+  The pcb is always reached through `client`.
 */
 typedef struct {
   struct tcpip_api_call_data call;
   AsyncClientImpl *client;
-  tcp_pcb **pcb;
   int8_t err;
   union {
     size_t close_ack;  // bytes to tcp_recved() before closing, in the same pass
@@ -811,10 +823,15 @@ typedef struct {
     } write;
     size_t received;
     struct {
-      ip_addr_t *addr;
+      const ip_addr_t *addr;
       uint16_t port;
-      tcp_connected_fn cb;
     } connect;
+    struct {
+      const char *host;
+      ip_addr_t *addr;
+      std::weak_ptr<AsyncClientImpl> *token;
+      uint16_t port;
+    } dns;
   };
 } tcp_api_call_t;
 
@@ -881,17 +898,17 @@ static esp_err_t _tcp_recved(AsyncClientImpl *client, size_t len) {
 }
 
 static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
-  // Unlike the other calls, this is not a direct wrapper of the LwIP function;
-  // we perform the AsyncClient teardown interlocked safely with the LwIP task.
+  // Unlike the other calls, this is not a direct wrapper of the LwIP function; we perform
+  // the AsyncClient teardown interlocked safely with the LwIP task.
 
-  // As a postcondition, the queue must not have any events referencing
-  // the AsyncClient in api_call_msg->close.  This is because it is possible for
-  // an error event to have been queued, clearing the pcb*, but after the async
-  // thread has committed to closing/destructing the AsyncClient object.
+  // As a postcondition, the queue must not have any events referencing this client.  This
+  // is because it is possible for an error event to have been queued, clearing the pcb*,
+  // but after the async thread has committed to closing/destructing the AsyncClient.
 
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   AsyncClientImpl *client = msg->client;
   msg->err = ERR_CONN;
+  _abandon_resolve(client);
   if (client->_pcb) {
     tcp_pcb *pcb = client->_pcb;
     // Ack anything the application withheld, in this same pass.  Done as a separate call
@@ -933,6 +950,7 @@ static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
   // ERR_CONN: nothing to do (pcb already null and no queued events).
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   AsyncClientImpl *client = msg->client;
+  _abandon_resolve(client);
   if (client->_pcb) {
     _reset_tcp_callbacks(client->_pcb, client);
     tcp_abort(client->_pcb);
@@ -945,46 +963,96 @@ static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
 }
 
 static esp_err_t _tcp_abort(AsyncClientImpl *client) {
+  // No early return on a null pcb.  An outstanding lookup is a second thing LwIP is
+  // holding, and standing it down has to happen inside the interlock.
   tcp_api_call_t msg;
   msg.client = client;
   tcpip_api_call(_tcp_abort_api, (struct tcpip_api_call_data *)&msg);
   return msg.err;
 }
 
-static err_t _tcp_connect_api(struct tcpip_api_call_data *api_call_msg) {
-  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
-  tcp_pcb *pcb = *msg->pcb;
-  // Non-zero only if the caller handed us an already-bound pcb
-  u16_t bound_port = pcb->local_port;
+static err_t _tcp_connect_in_context(AsyncClientImpl *client, const ip_addr_t *addr, uint16_t port) {
+#if LWIP_IPV4 && LWIP_IPV6
+  tcp_pcb *pcb = tcp_new_ip_type(addr->type);
+#else
+  tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+#endif
+  if (!pcb) {
+    async_tcp_log_e("pcb == NULL");
+    return ERR_MEM;
+  }
 
-  msg->err = tcp_connect(pcb, msg->connect.addr, msg->connect.port, msg->connect.cb);
-  if (msg->err != ERR_OK) {
+  // Take ownership of the pcb
+  client->_adopt(pcb);
+
+  err_t err = tcp_connect(pcb, addr, port, (tcp_connected_fn)&_tcp_connected);
+  if (err != ERR_OK) {
     // Failure - clean up
     _reset_tcp_callbacks(pcb, nullptr);
-    if (bound_port == 0) {
-      // tcp_connect() may have taken a local port without adding the pcb to
-      // tcp_bound_pcbs.  Clear it, or tcp_close() will try to remove the pcb from a
-      // list it was never on - which trips an assert on an empty list.
-      pcb->local_port = 0;
-    }
+    // Work around LwIP bug
+    // tcp_connect() may have taken a local port without adding the pcb to
+    // tcp_bound_pcbs.  Clear it, or tcp_close() will try to remove the pcb from a list
+    // it was never on.
+    pcb->local_port = 0;
     if (tcp_close(pcb) != ERR_OK) {
       tcp_abort(pcb);
     }
-    *msg->pcb = nullptr;  // PCB is now the property of LwIP
+    client->_pcb = nullptr;  // PCB is now the property of LwIP
+  }
+
+  return err;
+}
+
+static err_t _tcp_connect_api(struct tcpip_api_call_data *api_call_msg) {
+  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
+  msg->err = _tcp_connect_in_context(msg->client, msg->connect.addr, msg->connect.port);
+  return msg->err;
+}
+
+static esp_err_t _tcp_connect(AsyncClientImpl *client, const ip_addr_t *addr, uint16_t port) {
+  tcp_api_call_t msg;
+  msg.client = client;
+  msg.connect.addr = addr;
+  msg.connect.port = port;
+  tcpip_api_call(_tcp_connect_api, (struct tcpip_api_call_data *)&msg);
+  return msg.err;
+}
+
+/*
+  Start a name lookup and publish its token as one transaction.
+
+  These cannot be separate steps.  LwIP answers on its own thread, so a token published
+  after dns_gethostbyname() returns can arrive too late: the callback finds no token,
+  concludes it has been superseded, and drops an answer the caller is still waiting for -
+  leaving connect() having reported success that never resolves either way.
+
+  Taking the LwIP core lock around just the lookup would not fix it, and not only because
+  the window would remain: that lock does not exist without CONFIG_LWIP_TCPIP_CORE_LOCKING,
+  where the interlock is the api call itself and nothing else.
+*/
+static err_t _tcp_dns_start_api(struct tcpip_api_call_data *api_call_msg) {
+  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
+  AsyncClientImpl *client = msg->client;
+
+  // Supersedes any lookup already outstanding; that one will find the token moved on.
+  client->_connect_port = msg->dns.port;
+  client->_dns_token = msg->dns.token;
+
+  msg->err = dns_gethostbyname(msg->dns.host, msg->dns.addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, msg->dns.token);
+  if (msg->err != ERR_INPROGRESS) {
+    client->_dns_token = nullptr;  // no callback is coming
   }
   return msg->err;
 }
 
-static esp_err_t _tcp_connect(tcp_pcb **pcb, ip_addr_t *addr, uint16_t port, tcp_connected_fn cb) {
-  if (!pcb || !*pcb) {
-    return ESP_FAIL;
-  }
+static err_t _tcp_dns_start(AsyncClientImpl *client, const char *host, ip_addr_t *addr, uint16_t port, std::weak_ptr<AsyncClientImpl> *token) {
   tcp_api_call_t msg;
-  msg.pcb = pcb;
-  msg.connect.addr = addr;
-  msg.connect.port = port;
-  msg.connect.cb = cb;
-  tcpip_api_call(_tcp_connect_api, (struct tcpip_api_call_data *)&msg);
+  msg.client = client;
+  msg.dns.host = host;
+  msg.dns.addr = addr;
+  msg.dns.port = port;
+  msg.dns.token = token;
+  tcpip_api_call(_tcp_dns_start_api, (struct tcpip_api_call_data *)&msg);
   return msg.err;
 }
 
@@ -993,10 +1061,10 @@ static esp_err_t _tcp_connect(tcp_pcb **pcb, ip_addr_t *addr, uint16_t port, tcp
  */
 
 AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
-  : _facade(facade), _pcb(nullptr), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0),
-    _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true),
-    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0),
-    _dns_pending(false), _in_callback_ack_len(0) {}
+  : _pcb(nullptr), _connect_port(0), _dns_token(nullptr), _facade(facade), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0),
+    _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0),
+    _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0),
+    _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _in_callback_ack_len(0) {}
 
 AsyncClientImpl::~AsyncClientImpl() {
   // Every path that drops the last reference must ensure the binding was cleared first.
@@ -1012,9 +1080,12 @@ AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>
 }
 
 AsyncClient::~AsyncClient() {
-  if (_impl->_pcb) {
-    _impl->close();
-  }
+  // Unconditional.  Whether there is anything to close is not knowable from here: _pcb
+  // and the lookup token are both written by the LwIP thread, and a name lookup can
+  // still turn into a bound pcb after we have looked.  Deciding out here would be
+  // deciding whether we need the interlock without holding it; close() is cheap when
+  // there is nothing to do.
+  _impl->close();
   // Detach: queued events and LwIP callbacks may still reach the implementation, but
   // must not run user code against a facade that no longer exists.
   _impl->_facade = nullptr;
@@ -1041,7 +1112,7 @@ bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
     async_tcp_log_d("already connected, state %d", _pcb->state);
     return false;
   }
-  if (_dns_pending) {
+  if (_dns_token) {
     async_tcp_log_d("name resolution in progress");
     return false;
   }
@@ -1050,32 +1121,15 @@ bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
     return false;
   }
 
-  tcp_pcb *pcb;
-  {
-    tcp_core_guard tcg;
-#if LWIP_IPV4 && LWIP_IPV6
-    pcb = tcp_new_ip_type(addr.type);
-#else
-    pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-#endif
-    if (!pcb) {
-      async_tcp_log_e("pcb == NULL");
-      return false;
-    }
-    // Take ownership now: until _connected() arrives the pcb is only reachable
-    // through us, so close(), abort() and ~AsyncClient() must be able to find it.
-    _adopt(pcb);
-  }
-
-  if (_tcp_connect(&_pcb, &addr, port, (tcp_connected_fn)&_tcp_connected) == ESP_OK) {
+  // One pass through the LwIP context for the whole sequence; see
+  // _tcp_connect_in_context().  On failure it has already disposed of the pcb and
+  // cleared _pcb, and no callbacks were raised: we are returning failure.
+  if (_tcp_connect(this, &addr, port) == ERR_OK) {
     return true;
   }
-  // _pcb is now NULL and the api call cleared tcp_arg(), so the binding is gone.  No
-  // callbacks are raised: we are returning failure.
   async_tcp_log_d("connect failed");
   return false;
 }
-
 #ifdef ARDUINO
 bool AsyncClientImpl::connect(const IPAddress &ip, uint16_t port) {
   ip_addr_t addr;
@@ -1111,32 +1165,31 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
     async_tcp_log_d("already connected, state %d", _pcb->state);
     return false;
   }
-  if (_dns_pending) {
-    // LwIP coalesces a duplicate lookup onto the outstanding one anyway, so a retry
-    // never bought anything.  Let the attempt already in flight run to completion.
-    async_tcp_log_d("name resolution already in progress");
-    return true;
-  }
+
   if (!_start_async_task()) {
     async_tcp_log_e("failed to start task");
     return false;
   }
 
+  // A lookup already in flight is superseded rather than refused.  Ignoring the new
+  // call would silently dial the *previous* host and port and report success for it;
+  // refusing would be the better API, but previous versions would (brokenly) accept
+  // this (and then leak).  The classic case is a client retrying a "wedged" lookup --
+  // it's not really wedged, LwIP guarantees a return, but the timeouts might be longer
+  // than a client might expect.
+  // To avoid this leak, we allocate a unique "lookup context" for each request, and
+  // validate it when the request completes.  Ownership of the context lives in the
+  // LwIP DNS callback once triggered.
   std::unique_ptr<std::weak_ptr<AsyncClientImpl>> callback_state(new (std::nothrow) std::weak_ptr<AsyncClientImpl>(shared_from_this()));
   if (!callback_state) {
     async_tcp_log_e("Failed to allocate the lookup context");
     return false;
   }
 
-  err_t err;
-  {
-    tcp_core_guard tcg;
-    err = dns_gethostbyname(host, &addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, callback_state.get());
-  }
+  // Initiate DNS transaction
+  const err_t err = _tcp_dns_start(this, host, &addr, port, callback_state.get());
 
   if (err == ERR_INPROGRESS) {
-    _connect_port = port;
-    _dns_pending = true;
     // DNS lookup in progress
     callback_state.release();  // now tcp_dns_found's to destroy
     return true;
@@ -1168,7 +1221,6 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
 }
 
 void AsyncClientImpl::close() {
-  _abandonResolve();
   // Ack anything withheld by ackLater(), plus the packet onData is holding right now if
   // we are being called from inside it.  Without this the peer gets an RST rather than a
   // FIN for data the application did in fact process.
@@ -1188,7 +1240,6 @@ void AsyncClientImpl::close() {
 }
 
 int8_t AsyncClientImpl::abort() {
-  _abandonResolve();
   int8_t err = _tcp_abort(this);
   // _pcb is now NULL
   // LwIP invokes the error callback when abort is issued; preserve this semantic.
@@ -1265,15 +1316,8 @@ void AsyncClientImpl::ackLater() {
  * Private Callbacks
  * */
 
-// LwIP has no way to cancel a lookup, so record that we no longer want the answer.
-// tcp_dns_found() drops it and releases LwIP's reference when it eventually fires.
-void AsyncClientImpl::_abandonResolve() {
-  queue_mutex_guard guard;
-  _dns_pending = false;
-}
-
 // Adopt a pcb and reset all per-connection state.  Callers must already be
-// serialized against the LwIP core (accept callback, or tcp_core_guard).
+// serialized against the LwIP core - called from inside a transaction, or from a callback.
 void AsyncClientImpl::_adopt(tcp_pcb *pcb) {
   _pcb = pcb;
   _rx_ack_len = 0;
@@ -1400,20 +1444,6 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
     async_tcp_log_elapsed("onPoll", _poll_cb(_poll_cb_arg, _facade));
   }
   return ERR_OK;
-}
-
-void AsyncClientImpl::_dns_found(bool resolved, ip_addr_t *ipaddr, uint16_t port) {
-  if (resolved && ip_addr_isany_val(*ipaddr)) {
-    // A resolver that answers with the any-address - a sinkhole, or a blocklist - has
-    // not given us anywhere to go.  Report it as a failed lookup rather than dialling it.
-    resolved = false;
-  }
-  if (resolved && connect(*ipaddr, port)) {
-    return;
-  }
-  // connect() reported success to the caller, so this attempt owes them exactly one
-  // of onConnect or onError.
-  _error(resolved ? ERR_CONN : -55);
 }
 
 /*
@@ -1658,7 +1688,7 @@ bool AsyncClientImpl::connected() const {
 }
 
 bool AsyncClientImpl::connecting() const {
-  if (_dns_pending) {
+  if (_dns_token) {
     return true;  // resolving the hostname
   }
   if (!_pcb) {
@@ -1675,7 +1705,7 @@ bool AsyncClientImpl::disconnecting() const {
 }
 
 bool AsyncClientImpl::disconnected() const {
-  if (_dns_pending) {
+  if (_dns_token) {
     return false;  // resolving the hostname
   }
   if (!_pcb) {
