@@ -150,6 +150,9 @@ struct lwip_tcp_event_packet_t {
   lwip_tcp_event_packet_t *next;
   lwip_tcp_event_t event;
   std::shared_ptr<AsyncClientImpl> impl;  // keeps it alive for the life of the event
+  // Only an accept carries one.  It keeps the server's implementation alive too, so a
+  // connection still in flight can always find out whether it still has somewhere to go.
+  std::shared_ptr<AsyncServerImpl> server;
   union {
     struct {
       tcp_pcb *pcb;
@@ -175,7 +178,7 @@ struct lwip_tcp_event_packet_t {
       tcp_pcb *pcb;
     } poll;
     struct {
-      AsyncServer *server;
+      uint32_t epoch;  // the listening session this connection was accepted on
     } accept;
   };
 
@@ -376,6 +379,66 @@ public:
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
 };
 
+/*
+  Server implementation class
+
+  This has the same basic pattern as AsyncClient: an underlying shared_ptr allows the
+  event dispatcher to hold the implementation in scope if it is destroyed by the application
+  while a connection is being constructed.
+
+  _facade is the orphan indicator.  ~AsyncServer() clears it, and a queued connection that
+  finds it null is dropped as though it never arrived.  A connection accepted before end()
+  is dropped too, on the epoch rather than on _pcb - see below.
+
+  One consequence of outliving the facade: the last reference can be dropped by a purge on
+  the LwIP thread, so this object's destructor - and with it the application's onClient
+  std::function - can run there.  That is the same exposure AsyncClientImpl's callbacks
+  have, and the same caution applies: nothing captured by a handler may re-enter the
+  library from its own destructor.
+*/
+class AsyncServerImpl : public std::enable_shared_from_this<AsyncServerImpl> {
+public:
+  AsyncServerImpl(AsyncServer *facade, ip_addr_t addr, uint16_t port)
+    : _pcb(nullptr), _epoch(0), _facade(facade), _addr(addr), _port(port), _noDelay(false), _connect_cb(nullptr), _connect_cb_arg(nullptr) {
+    _init_queue_mutex();
+  }
+  ~AsyncServerImpl() {
+    ASYNCTCP_ASSERT(!_pcb);
+  }
+
+  AsyncServerImpl(const AsyncServerImpl &) = delete;
+  AsyncServerImpl &operator=(const AsyncServerImpl &) = delete;
+
+  // Written only inside the LwIP context; null once we have stopped listening.
+  tcp_pcb *_pcb;
+
+  /*
+    Which listening session we are on.  Bumped in LwIP context in end() to ensure any pending
+    connections do not get mishandled if a client should call end() then begin() before LwIP
+    can dispatch them.
+  */
+  uint32_t _epoch;
+
+  // Cleared by ~AsyncServer().  Read without a lock on the async task, on the same terms
+  // as AsyncClientImpl::_facade - see the note there.
+  AsyncServer *_facade;
+
+  // Not synchronized: set up before begin() and read afterwards.
+  ip_addr_t _addr;
+  uint16_t _port;
+  bool _noDelay;
+  AcConnectHandler _connect_cb;
+  void *_connect_cb_arg;
+
+  ASYNCTCP_ALWAYS_INLINE void onClient(AcConnectHandler cb, void *arg);
+  ASYNCTCP_ALWAYS_INLINE void begin();
+  ASYNCTCP_ALWAYS_INLINE void end();
+  ASYNCTCP_ALWAYS_INLINE void setNoDelay(bool nodelay);
+  ASYNCTCP_ALWAYS_INLINE bool getNoDelay() const;
+  ASYNCTCP_ALWAYS_INLINE uint8_t status() const;
+  int8_t _accepted(AsyncClient *client);
+};
+
 static uint32_t _xor_shift_state = 31;  // any nonzero seed will do
 static uint32_t _xor_shift_next() {
   uint32_t x = _xor_shift_state;
@@ -490,32 +553,19 @@ static size_t _remove_events_for_client(AsyncClientImpl *client, lwip_tcp_event_
   return count;
 };
 
-// Called from AsyncServer::end() on the application thread, so it can destroy any
-// clients that were accepted but never delivered to onClient.
-/*
-  Orphan this server's queued accept events.  Safe inside the LwIP context - the accept
-  callback that would add more runs on this same thread - and it leaves the cleanup to the
-  async task, which is where closing a connection is allowed.  The connections are dropped
-  as though they never arrived; the application has never seen them.
-*/
-static void _orphan_events_for_server(AsyncServer *server) {
-  queue_mutex_guard guard;
-  for (lwip_tcp_event_packet_t *pkt = _async_queue.begin(); pkt; pkt = pkt->next) {
-    if ((pkt->event == LWIP_TCP_ACCEPT) && (pkt->accept.server == server)) {
-      pkt->accept.server = nullptr;
-    }
-  }
-}
-
 void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
   ASYNCTCP_ASSERT(e->impl);
 
   if (e->event == LWIP_TCP_ACCEPT) {
     // Accept is checked first because we need to handle it before the client facade check,
     // since we haven't constructed a facade for it yet.
-    AsyncClient *c = e->accept.server ? new (std::nothrow) AsyncClient(e->impl) : nullptr;
+    AsyncServerImpl *server = e->server.get();
+    const bool wanted = server && server->_facade               // the application still has this server
+                        && (server->_epoch == e->accept.epoch)  // ...and has not stopped listening since
+                        && e->impl->_pcb;                       // ...and the connection is still up
+    AsyncClient *c = wanted ? new (std::nothrow) AsyncClient(e->impl) : nullptr;
     if (c) {
-      e->accept.server->_accepted(c);
+      server->_accepted(c);
     } else {
       e->impl->close();  // Not wanted or failed to create a client facade
     }
@@ -2023,57 +2073,73 @@ void AsyncClient::onPoll(AcConnectHandler cb, void *arg) {
   Async TCP Server
  */
 
-AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port)
-  : _port(port), _addr(addr), _noDelay(false), _pcb(nullptr), _connect_cb(nullptr), _connect_cb_arg(nullptr) {
-  _init_queue_mutex();
-}
+AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port) : _impl(std::make_shared<AsyncServerImpl>(this, addr, port)) {}
 
 #ifdef ARDUINO
-AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
-  _init_queue_mutex();
+AsyncServer::AsyncServer(IPAddress addr, uint16_t port) {
+  ip_addr_t a;
 #if ESP_IDF_VERSION_MAJOR < 5
 #if LWIP_IPV4 && LWIP_IPV6
-  _addr.type = IPADDR_TYPE_V4;
-  _addr.u_addr.ip4.addr = addr;
+  a.type = IPADDR_TYPE_V4;
+  a.u_addr.ip4.addr = addr;
 #else
-  _addr.addr = addr;
+  a.addr = addr;
 #endif
 #else
-  addr.to_ip_addr_t(&_addr);
+  addr.to_ip_addr_t(&a);
 #endif
+  _impl = std::make_shared<AsyncServerImpl>(this, a, port);
 }
 #if ESP_IDF_VERSION_MAJOR < 5 && __has_include(<IPv6Address.h>) && LWIP_IPV6
-AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
-  _init_queue_mutex();
-#if LWIP_IPV4 && LWIP_IPV6
-  _addr.type = IPADDR_TYPE_V6;
-#endif
+AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) {
   auto ipaddr = static_cast<const uint32_t *>(addr);
-  _addr = IPADDR6_INIT(ipaddr[0], ipaddr[1], ipaddr[2], ipaddr[3]);
+  ip_addr_t a = IPADDR6_INIT(ipaddr[0], ipaddr[1], ipaddr[2], ipaddr[3]);
+#if LWIP_IPV4 && LWIP_IPV6
+  a.type = IPADDR_TYPE_V6;
+#endif
+  _impl = std::make_shared<AsyncServerImpl>(this, a, port);
 }
 #endif
 #endif
 
-AsyncServer::AsyncServer(uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
-  _init_queue_mutex();
+AsyncServer::AsyncServer(uint16_t port) {
+  ip_addr_t a;
 #if LWIP_IPV4 && LWIP_IPV6
-  _addr.type = IPADDR_TYPE_ANY;
-  _addr.u_addr.ip4.addr = INADDR_ANY;
+  a.type = IPADDR_TYPE_ANY;
+  a.u_addr.ip4.addr = INADDR_ANY;
 #else
-  _addr.addr = INADDR_ANY;
+  a.addr = INADDR_ANY;
 #endif
+  _impl = std::make_shared<AsyncServerImpl>(this, a, port);
 }
 
 AsyncServer::~AsyncServer() {
-  end();
+  _impl->end();
+  // Detach: a connection accepted but not yet delivered still points at the implementation,
+  // and this is how it learns there is no longer a server to hand it to.
+  _impl->_facade = nullptr;
 }
 
 void AsyncServer::onClient(AcConnectHandler cb, void *arg) {
-  _connect_cb = cb;
-  _connect_cb_arg = arg;
+  _impl->onClient(cb, arg);
+}
+void AsyncServer::begin() {
+  _impl->begin();
+}
+void AsyncServer::end() {
+  _impl->end();
+}
+void AsyncServer::setNoDelay(bool nodelay) {
+  _impl->setNoDelay(nodelay);
+}
+bool AsyncServer::getNoDelay() const {
+  return _impl->getNoDelay();
+}
+uint8_t AsyncServer::status() const {
+  return _impl->status();
 }
 
-void AsyncServer::begin() {
+void AsyncServerImpl::begin() {
   if (_pcb) {
     return;
   }
@@ -2092,7 +2158,7 @@ void AsyncServer::begin() {
   */
   struct begin_call {
     struct tcpip_api_call_data call;
-    AsyncServer *server;
+    AsyncServerImpl *server;
     err_t err;
   } args;
   args.server = this;
@@ -2101,7 +2167,7 @@ void AsyncServer::begin() {
   tcpip_api_call(
     +[](struct tcpip_api_call_data *c) -> err_t {
       begin_call *a = reinterpret_cast<begin_call *>(c);
-      AsyncServer *server = a->server;
+      AsyncServerImpl *server = a->server;
 
 #if LWIP_IPV4 && LWIP_IPV6
       tcp_pcb *pcb = tcp_new_ip_type(server->_addr.type);
@@ -2149,20 +2215,20 @@ void AsyncServer::begin() {
   }
 }
 
-void AsyncServer::end() {
-  // The mirror of begin(): stop listening and disown anything already queued, in one
-  // transaction.  The queued connections are not torn down here - closing one is itself a
-  // transaction - so they are marked and the async task drops them when it gets to them.
+void AsyncServerImpl::end() {
+  // The mirror of begin(): stop listening, and disown anything accepted but not fully constructed
+  // on the session we are closing.  Those connections are not torn down here to avoid racing with
+  // the async thread; the async task drops them when it reaches them.
   struct end_call {
     struct tcpip_api_call_data call;
-    AsyncServer *server;
+    AsyncServerImpl *server;
   } args;
   args.server = this;
 
   tcpip_api_call(
     +[](struct tcpip_api_call_data *c) -> err_t {
       end_call *a = reinterpret_cast<end_call *>(c);
-      AsyncServer *server = a->server;
+      AsyncServerImpl *server = a->server;
       if (server->_pcb) {
         tcp_arg(server->_pcb, NULL);
         tcp_accept(server->_pcb, NULL);
@@ -2171,7 +2237,9 @@ void AsyncServer::end() {
         }
         server->_pcb = NULL;  // PCB is now the property of LwIP
       }
-      _orphan_events_for_server(server);
+      // Disown anything already accepted on the session we just closed.  Bumped inside the
+      // transaction, so it is ordered against tcp_accept() rather than racing it.
+      ++server->_epoch;
       return ERR_OK;
     },
     &args.call
@@ -2190,7 +2258,7 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
     return ERR_ABRT;
   }
 
-  auto server = reinterpret_cast<AsyncServer *>(arg);
+  auto server = reinterpret_cast<AsyncServerImpl *>(arg);
   if (!server->_connect_cb) {
     async_tcp_log_e("_accept failed: no onConnect callback");
     tcp_abort(pcb);
@@ -2212,14 +2280,15 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
   e->impl = std::make_shared<AsyncClientImpl>(nullptr);
   e->impl->_adopt(pcb);
   e->impl->setNoDelay(server->_noDelay);
-  e->accept.server = server;
+  e->server = server->shared_from_this();  // Lock server impl in scope
+  e->accept.epoch = server->_epoch;        // And remember in case it's end()ed
 
   queue_mutex_guard guard;
   _prepend_async_event(e);
   return ERR_OK;
 }
 
-int8_t AsyncServer::_accepted(AsyncClient *client) {
+int8_t AsyncServerImpl::_accepted(AsyncClient *client) {
   if (_connect_cb) {
     async_tcp_log_elapsed("onClient", _connect_cb(_connect_cb_arg, client));
   } else {
@@ -2228,15 +2297,20 @@ int8_t AsyncServer::_accepted(AsyncClient *client) {
   return ERR_OK;
 }
 
-void AsyncServer::setNoDelay(bool nodelay) {
+void AsyncServerImpl::onClient(AcConnectHandler cb, void *arg) {
+  _connect_cb = cb;
+  _connect_cb_arg = arg;
+}
+
+void AsyncServerImpl::setNoDelay(bool nodelay) {
   _noDelay = nodelay;
 }
 
-bool AsyncServer::getNoDelay() const {
+bool AsyncServerImpl::getNoDelay() const {
   return _noDelay;
 }
 
-uint8_t AsyncServer::status() const {
+uint8_t AsyncServerImpl::status() const {
   if (!_pcb) {
     return 0;
   }

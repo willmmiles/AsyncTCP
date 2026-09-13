@@ -74,6 +74,7 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 struct tcp_pcb;
 class AsyncTCP_detail;
 class AsyncClientImpl;
+class AsyncServerImpl;
 
 class AsyncClient {
 public:
@@ -293,6 +294,16 @@ public:
 #endif
   AsyncServer(uint16_t port);
   ~AsyncServer();
+
+  // Noncopyable: the implementation holds one back-pointer, so a second facade sharing it
+  // would leave one of them unreachable from it.
+  AsyncServer(const AsyncServer &) = delete;
+  AsyncServer &operator=(const AsyncServer &) = delete;
+
+  // Nonmovable
+  AsyncServer(AsyncServer &&) = delete;
+  AsyncServer &operator=(AsyncServer &&) = delete;
+
   void onClient(AcConnectHandler cb, void *arg);
   void begin();
   void end();
@@ -303,15 +314,11 @@ public:
 protected:
   friend class AsyncTCP_detail;
 
-  uint16_t _port;
-  ip_addr_t _addr;
-  bool _noDelay;
-  tcp_pcb *_pcb;
-  AcConnectHandler _connect_cb;
-  void *_connect_cb_arg;
-
-  int8_t _accept(tcp_pcb *newpcb, int8_t err);
-  int8_t _accepted(AsyncClient *client);
+  // As with AsyncClient, every scrap of state lives in the implementation object, which
+  // outlives this facade: a connection accepted but not yet delivered holds a reference to
+  // it.  Destroying an AsyncServer clears the implementation's back-pointer, which is how
+  // a connection still in flight learns that there is no longer anywhere to deliver it.
+  std::shared_ptr<AsyncServerImpl> _impl;
 };
 
 #endif /* ASYNCTCP_H_ */
