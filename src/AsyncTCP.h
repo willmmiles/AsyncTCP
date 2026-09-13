@@ -270,6 +270,11 @@ protected:
   friend class AsyncTCP_detail;
   friend class AsyncServer;
 
+  // Adopts an implementation that already exists.  A connection accepted by AsyncServer
+  // gets its implementation on the LwIP thread but its facade here, on the async task,
+  // because destroying a facade closes it and closing is a transaction.
+  explicit AsyncClient(std::shared_ptr<AsyncClientImpl> impl);
+
   // Every scrap of state lives in the implementation object, which outlives this
   // facade: queued events share ownership of it.  That keeps the callbacks themselves
   // alive for the duration of a call, so destroying an AsyncClient from inside one of
