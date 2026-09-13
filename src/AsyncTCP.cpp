@@ -1382,19 +1382,26 @@ int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, _facade, b->payload, b->len));
       }
-      if (_in_callback_ack_len) {  // still ours - close() did not take it
+      pbuf_free(b);
+      if (_pcb != pcb) {
+        // Bizarre as it might sound, it's actually possible for the user callback to reconnect.
+        _in_callback_ack_len = 0;
+        break;
+      }
+      if (_in_callback_ack_len) {
         if (!_ack_pcb) {
           _rx_ack_len += _in_callback_ack_len;
-        } else if (_pcb) {
+        } else {
           _tcp_recved(this, _in_callback_ack_len);
         }
         _in_callback_ack_len = 0;
       }
-      pbuf_free(b);
     }
-    // Stop if the callback closed the connection or destroyed the client.  We outlive
-    // the facade, but there is nobody left to hand the remaining packets to.
-    if (!_pcb || !_facade) {
+    // Stop if the callback closed the connection, destroyed the client, or replaced the
+    // connection outright - a callback that reconnects leaves _pcb non-null but pointing
+    // at a different peer, and the rest of this chain belongs to the old one.  Comparing
+    // against the pcb the data arrived on covers all three.
+    if (_pcb != pcb || !_facade) {
       break;
     }
   }
