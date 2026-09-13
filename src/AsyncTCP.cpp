@@ -9,6 +9,16 @@
 #include <memory>
 
 /**
+ * Assertion macros
+ * ESP-IDF leaves assertions on by default; we prefer the opposite as performance in this layer is critical.
+ */
+#ifdef CONFIG_ASYNC_TCP_ASSERTIONS
+#define ASYNCTCP_ASSERT(x) assert(x)
+#else
+#define ASYNCTCP_ASSERT(x) ((void)0)
+#endif
+
+/**
  * Utility macro
  *
  * Most API functions are delegated to the impl class.  Ensure the wrapped functions are always inlined
@@ -383,17 +393,15 @@ static void _free_event(lwip_tcp_event_packet_t *evpkt) {
 }
 
 static inline void _send_async_event(lwip_tcp_event_packet_t *e) {
-  if (e == nullptr) {
-    return;
-  }
+  ASYNCTCP_ASSERT(e != nullptr);
+  ASYNCTCP_ASSERT(e->impl != nullptr);
   _async_queue.push_back(e);
   xTaskNotifyGive(_async_service_task_handle);
 }
 
 static inline void _prepend_async_event(lwip_tcp_event_packet_t *e) {
-  if (e == nullptr) {
-    return;
-  }
+  ASYNCTCP_ASSERT(e != nullptr);
+  ASYNCTCP_ASSERT(e->impl != nullptr);
   _async_queue.push_front(e);
   xTaskNotifyGive(_async_service_task_handle);
 }
@@ -500,6 +508,8 @@ static void _orphan_events_for_server(AsyncServer *server) {
 }
 
 void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
+  ASYNCTCP_ASSERT(e->impl);
+
   if (e->event == LWIP_TCP_ACCEPT) {
     // Accept is checked first because we need to handle it before the client facade check,
     // since we haven't constructed a facade for it yet.
@@ -509,7 +519,7 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
     } else {
       e->impl->close();  // Not wanted or failed to create a client facade
     }
-  } else if ((e->impl == NULL) || (e->impl->_facade == NULL)) {
+  } else if ((e->impl->_facade == NULL)) {
     // A detached implementation has no facade to hand to the user's callbacks, so its
     // events simply drain.  The reference the event holds keeps it alive until then.
     // ets_printf("event arg == NULL: 0x%08x\n", e->recv.pcb);
@@ -1060,7 +1070,7 @@ AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
 AsyncClientImpl::~AsyncClientImpl() {
   // Every path that drops the last reference must ensure the binding was cleared first.
   // This can be called from the LwIP thread, so any cleanup must have been performed already.
-  assert(!_pcb);
+  ASYNCTCP_ASSERT(!_pcb);
 }
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>(this)) {
