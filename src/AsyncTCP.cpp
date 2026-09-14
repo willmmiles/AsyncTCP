@@ -5,6 +5,7 @@
 #include "AsyncTCPLogging.h"
 #include "AsyncTCPSimpleIntrusiveList.h"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <type_traits>
@@ -914,11 +915,6 @@ typedef struct {
   int8_t err;
   union {
     size_t close_ack;  // bytes to tcp_recved() before closing, in the same pass
-    struct {
-      const char *data;
-      size_t size;
-      uint8_t apiflags;
-    } write;
     size_t received;
     struct {
       const ip_addr_t *addr;
@@ -949,28 +945,6 @@ static esp_err_t _tcp_output(AsyncClientImpl *client) {
   tcp_api_call_t msg;
   msg.client = client;
   tcpip_api_call(_tcp_output_api, (struct tcpip_api_call_data *)&msg);
-  return msg.err;
-}
-
-static err_t _tcp_write_api(struct tcpip_api_call_data *api_call_msg) {
-  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
-  msg->err = ERR_CONN;
-  if (msg->client->_pcb) {
-    msg->err = tcp_write(msg->client->_pcb, msg->write.data, msg->write.size, msg->write.apiflags);
-  }
-  return msg->err;
-}
-
-static esp_err_t _tcp_write(AsyncClientImpl *client, const char *data, size_t size, uint8_t apiflags) {
-  if (!client->_pcb) {
-    return ERR_CONN;
-  }
-  tcp_api_call_t msg;
-  msg.client = client;
-  msg.write.data = data;
-  msg.write.size = size;
-  msg.write.apiflags = apiflags;
-  tcpip_api_call(_tcp_write_api, (struct tcpip_api_call_data *)&msg);
   return msg.err;
 }
 
@@ -1364,17 +1338,21 @@ size_t AsyncClientImpl::add(const char *data, size_t size, uint8_t apiflags) {
   if (!_pcb || size == 0 || data == NULL) {
     return 0;
   }
-  size_t room = space();
-  if (!room) {
+  // Early check outside of lock
+  if (space() == 0) {
     return 0;
   }
-  size_t will_send = (room < size) ? room : size;
-  int8_t err = ERR_OK;
-  err = _tcp_write(this, data, will_send, apiflags);
+  auto err = with_tcp_core_lock([&]() -> err_t {
+    if (!_pcb) {
+      return ERR_CONN;
+    }
+    size = std::min(size, space());
+    return tcp_write(_pcb, data, size, apiflags);
+  });
   if (err != ERR_OK) {
     return 0;
   }
-  return will_send;
+  return size;
 }
 
 bool AsyncClientImpl::send() {
