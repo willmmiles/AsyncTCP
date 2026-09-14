@@ -7,6 +7,7 @@
 
 #include <cassert>
 #include <memory>
+#include <type_traits>
 
 /**
  * Assertion macros
@@ -71,6 +72,7 @@ extern "C" {
 #include "lwip/opt.h"
 #include "lwip/tcp.h"
 #include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 }
 
 #if CONFIG_ASYNC_TCP_USE_WDT
@@ -95,33 +97,65 @@ extern "C" {
     async_tcp_log_v("%s took %" PRIu32 " us", tag, micros() - s_time); \
   }
 
-// https://github.com/espressif/arduino-esp32/issues/10526
+/**
+ * LwIP locking
+ *
+ * Utilities for managing LwIP TCP core mutexing.  Includes two features
+ * - tcp_core_guard: a guard class usable when LWIP_TCPIP_CORE_LOCKING exposes the mutex for direct usage
+ * - with_tcp_core_lock: a metafunction that runs a function inside the LwIP TCP core lock context, using the most efficient method available on the current build.
+ *
+ * https://github.com/espressif/arduino-esp32/issues/10526
+ */
 namespace {
-#ifdef CONFIG_LWIP_TCPIP_CORE_LOCKING
+#if LWIP_TCPIP_CORE_LOCKING
 struct tcp_core_guard {
-  bool do_lock;
-  inline tcp_core_guard() : do_lock(!sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
-    if (do_lock) {
-      LOCK_TCPIP_CORE();
-    }
+  inline tcp_core_guard() {
+    LOCK_TCPIP_CORE();
   }
   inline ~tcp_core_guard() {
-    if (do_lock) {
-      UNLOCK_TCPIP_CORE();
-    }
+    UNLOCK_TCPIP_CORE();
   }
   tcp_core_guard(const tcp_core_guard &) = delete;
   tcp_core_guard(tcp_core_guard &&) = delete;
   tcp_core_guard &operator=(const tcp_core_guard &) = delete;
   tcp_core_guard &operator=(tcp_core_guard &&) = delete;
 } __attribute__((unused));
-#else   // CONFIG_LWIP_TCPIP_CORE_LOCKING
+#else   // LWIP_TCPIP_CORE_LOCKING
 struct tcp_core_guard {
 } __attribute__((unused));
-#endif  // CONFIG_LWIP_TCPIP_CORE_LOCKING
-}  // anonymous namespace
+#endif  // LWIP_TCPIP_CORE_LOCKING
 
-#define INVALID_CLOSED_SLOT -1
+/*
+  Locking metafunction for TCP core operations.
+
+  Runs a function inside the LwIP context by whichever route is cheapest on this build.
+  Where the core lock exists we take it and call straight through, which avoids marshaling
+  the arguments through a message.  Where direct locking is not available, we wrap the function
+  call with tcpip_api_call.
+*/
+template<typename T> err_t with_tcp_core_lock(T &&func) {
+#if LWIP_TCPIP_CORE_LOCKING || NO_SYS
+  tcp_core_guard guard;
+  return func();
+#else
+  // The functor is reached by pointer: a reference member would leave the struct without
+  // a default constructor, and it only has to outlive the call.
+  struct call_data {
+    struct tcpip_api_call_data call;  // must be first member
+    typename std::remove_reference<T>::type *f;
+  } data;
+  data.f = &func;
+  return tcpip_api_call(
+    // The lambda here constructs a C function which perfectly forwards the call to the functor.
+    +[](struct tcpip_api_call_data *c) -> err_t {
+      return (*reinterpret_cast<call_data *>(c)->f)();
+    },
+    &data.call
+  );
+#endif
+}
+
+}  // anonymous namespace
 
 /*
   TCP poll interval is specified in terms of the TCP coarse timer interval, which is called twice a second
@@ -403,6 +437,10 @@ public:
     _init_queue_mutex();
   }
   ~AsyncServerImpl() {
+    // end() here would be wrong for the same reason ~AsyncClientImpl does not close: the
+    // last reference can be dropped by a purge on the LwIP thread, and end() is a
+    // transaction, which from there would wait for itself.  Every path that releases the
+    // implementation has already stopped it listening.
     ASYNCTCP_ASSERT(!_pcb);
   }
 
@@ -854,8 +892,6 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
 /*
  * TCP/IP API Calls
  * */
-
-#include "lwip/priv/tcpip_priv.h"
 
 /*
   Context structure for `tcpip_api_call`, ie. code running in LwIP context.
@@ -2156,62 +2192,45 @@ void AsyncServerImpl::begin() {
     could see a pcb bound but not listening, or listening with no accept callback and no
     argument, and _pcb itself was published in stages.
   */
-  struct begin_call {
-    struct tcpip_api_call_data call;
-    AsyncServerImpl *server;
-    err_t err;
-  } args;
-  args.server = this;
-  args.err = ERR_OK;
-
-  tcpip_api_call(
-    +[](struct tcpip_api_call_data *c) -> err_t {
-      begin_call *a = reinterpret_cast<begin_call *>(c);
-      AsyncServerImpl *server = a->server;
-
+  auto err = with_tcp_core_lock([&]() -> err_t {
 #if LWIP_IPV4 && LWIP_IPV6
-      tcp_pcb *pcb = tcp_new_ip_type(server->_addr.type);
+    tcp_pcb *pcb = tcp_new_ip_type(_addr.type);
 #else
-      tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
+    tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
 #endif
-      if (!pcb) {
-        a->err = ERR_MEM;
-        return a->err;
+    if (!pcb) {
+      return ERR_MEM;
+    }
+
+    auto err = tcp_bind(pcb, &_addr, _port);
+    if (err != ERR_OK) {
+      // Never registered, so nothing can reach it; dispose of it here.
+      if (tcp_close(pcb) != ERR_OK) {
+        tcp_abort(pcb);
       }
+      return err;
+    }
 
-      a->err = tcp_bind(pcb, &server->_addr, server->_port);
-      if (a->err != ERR_OK) {
-        // Never registered, so nothing can reach it; dispose of it here.
-        if (tcp_close(pcb) != ERR_OK) {
-          tcp_abort(pcb);
-        }
-        return a->err;
+    tcp_pcb *listen_pcb = tcp_listen_with_backlog(pcb, ASYNCTCP_LISTEN_BACKLOG);
+    if (!listen_pcb) {
+      // LwIP frees the original only on success; ours is still bound, and holds the
+      // port reserved until we release it.
+      if (tcp_close(pcb) != ERR_OK) {
+        tcp_abort(pcb);
       }
+      return ERR_MEM;
+    }
 
-      tcp_pcb *listen_pcb = tcp_listen_with_backlog(pcb, ASYNCTCP_LISTEN_BACKLOG);
-      if (!listen_pcb) {
-        // LwIP frees the original only on success; ours is still bound, and holds the
-        // port reserved until we release it.
-        if (tcp_close(pcb) != ERR_OK) {
-          tcp_abort(pcb);
-        }
-        a->err = ERR_MEM;
-        return a->err;
-      }
+    // Published last, and with its callbacks already attached: an accept cannot arrive
+    // against a server that is not ready for it.
+    tcp_arg(listen_pcb, this);
+    tcp_accept(listen_pcb, &AsyncTCP_detail::tcp_accept);
+    _pcb = listen_pcb;
+    return ERR_OK;
+  });  // end LwIP scope
 
-      // Published last, and with its callbacks already attached: an accept cannot arrive
-      // against a server that is not ready for it.
-      tcp_arg(listen_pcb, server);
-      tcp_accept(listen_pcb, &AsyncTCP_detail::tcp_accept);
-      server->_pcb = listen_pcb;
-      a->err = ERR_OK;
-      return a->err;
-    },
-    &args.call
-  );
-
-  if (args.err != ERR_OK) {
-    async_tcp_log_e("begin failed: %d", (int)args.err);
+  if (err != ERR_OK) {
+    async_tcp_log_e("begin failed: %d", (int)err);
   }
 }
 
@@ -2219,31 +2238,20 @@ void AsyncServerImpl::end() {
   // The mirror of begin(): stop listening, and disown anything accepted but not fully constructed
   // on the session we are closing.  Those connections are not torn down here to avoid racing with
   // the async thread; the async task drops them when it reaches them.
-  struct end_call {
-    struct tcpip_api_call_data call;
-    AsyncServerImpl *server;
-  } args;
-  args.server = this;
-
-  tcpip_api_call(
-    +[](struct tcpip_api_call_data *c) -> err_t {
-      end_call *a = reinterpret_cast<end_call *>(c);
-      AsyncServerImpl *server = a->server;
-      if (server->_pcb) {
-        tcp_arg(server->_pcb, NULL);
-        tcp_accept(server->_pcb, NULL);
-        if (tcp_close(server->_pcb) != ERR_OK) {
-          tcp_abort(server->_pcb);
-        }
-        server->_pcb = NULL;  // PCB is now the property of LwIP
+  with_tcp_core_lock([&]() -> err_t {
+    if (_pcb) {
+      tcp_arg(_pcb, NULL);
+      tcp_accept(_pcb, NULL);
+      if (tcp_close(_pcb) != ERR_OK) {
+        tcp_abort(_pcb);
       }
-      // Disown anything already accepted on the session we just closed.  Bumped inside the
-      // transaction, so it is ordered against tcp_accept() rather than racing it.
-      ++server->_epoch;
-      return ERR_OK;
-    },
-    &args.call
-  );
+      _pcb = NULL;  // PCB is now the property of LwIP
+    }
+    // Disown anything already accepted on the session we just closed.  Bumped inside the
+    // transaction, so it is ordered against tcp_accept() rather than racing it.
+    ++_epoch;
+    return ERR_OK;
+  });
 }
 
 // runs on LwIP thread
