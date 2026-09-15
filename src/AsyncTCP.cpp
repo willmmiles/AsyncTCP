@@ -313,11 +313,11 @@ public:
 
   /*
     Members held under LwIP context
-
   */
   tcp_pcb *_pcb;
   uint16_t _connect_port;
   std::weak_ptr<AsyncClientImpl> *_dns_token;  // non-owning pointer to the most recent DNS lookup token
+  bool _dispose_owed;                          // a terminal notification is owed to the application
 
   /*
     Not synchronized.  The handlers are installed by the application before it connects
@@ -1069,7 +1069,8 @@ static err_t _tcp_connect_in_context(AsyncClientImpl *client, const ip_addr_t *a
     if (tcp_close(pcb) != ERR_OK) {
       tcp_abort(pcb);
     }
-    client->_pcb = nullptr;  // PCB is now the property of LwIP
+    client->_pcb = nullptr;
+    // Note that _adopt() armed _dispose_owed; the caller will need to clear it if it is no longer needed.
   }
 
   return err;
@@ -1078,6 +1079,10 @@ static err_t _tcp_connect_in_context(AsyncClientImpl *client, const ip_addr_t *a
 static err_t _tcp_connect_api(struct tcpip_api_call_data *api_call_msg) {
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   msg->err = _tcp_connect_in_context(msg->client, msg->connect.addr, msg->connect.port);
+  // On a failure, release _dispose_owed while we still hold the LwIP lock.
+  if (msg->err != ERR_OK) {
+    msg->client->_dispose_owed = false;
+  }
   return msg->err;
 }
 
@@ -1107,11 +1112,23 @@ static err_t _tcp_dns_start_api(struct tcpip_api_call_data *api_call_msg) {
   AsyncClientImpl *client = msg->client;
 
   // Supersedes any lookup already outstanding; that one will find the token moved on.
+  if (client->_dns_token) {
+    // The displaced lookup will never report, so its obligation dies with it rather than
+    // passing to this attempt - which may answer from cache and never arm one of its own,
+    // and would then refuse itself on a notice nobody can ever deliver.
+    client->_dispose_owed = false;
+  }
   client->_connect_port = msg->dns.port;
   client->_dns_token = msg->dns.token;
 
   msg->err = dns_gethostbyname(msg->dns.host, msg->dns.addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, msg->dns.token);
-  if (msg->err != ERR_INPROGRESS) {
+  if (msg->err == ERR_INPROGRESS) {
+    // Reporting success promises onConnect or onError, and a dispose with it, even though no
+    // pcb exists yet (and may never).  Armed here rather than on return: the answer can land
+    // the instant this transaction ends, and an error reported before the caller had armed it
+    // would consume a notification that was not yet owed - and then rearm it forever.
+    client->_dispose_owed = true;
+  } else {
     client->_dns_token = nullptr;  // no callback is coming
   }
   return msg->err;
@@ -1133,9 +1150,9 @@ static err_t _tcp_dns_start(AsyncClientImpl *client, const char *host, ip_addr_t
  */
 
 AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
-  : _pcb(nullptr), _connect_port(0), _dns_token(nullptr), _facade(facade), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0),
-    _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0),
-    _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0),
+  : _pcb(nullptr), _connect_port(0), _dns_token(nullptr), _dispose_owed(false), _facade(facade), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0),
+    _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0),
+    _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0),
     _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _in_callback_ack_len(0) {}
 
 AsyncClientImpl::~AsyncClientImpl() {
@@ -1156,11 +1173,9 @@ AsyncClient::AsyncClient(std::shared_ptr<AsyncClientImpl> impl) : _impl(std::mov
 }
 
 AsyncClient::~AsyncClient() {
-  // Unconditional.  Whether there is anything to close is not knowable from here: _pcb
-  // and the lookup token are both written by the LwIP thread, and a name lookup can
-  // still turn into a bound pcb after we have looked.  Deciding out here would be
-  // deciding whether we need the interlock without holding it; close() is cheap when
-  // there is nothing to do.
+  // Unconditional, because whether there is anything to close is not knowable from here -
+  // _pcb and the lookup token are both written by the LwIP thread, and a name lookup can
+  // still turn into a bound pcb after we have looked.
   _impl->close();
   // Detach: queued events and LwIP callbacks may still reach the implementation, but
   // must not run user code against a facade that no longer exists.
@@ -1192,14 +1207,21 @@ bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
     async_tcp_log_d("name resolution in progress");
     return false;
   }
+  if (_dispose_owed) {
+    // A previous failed connection has not reported yet - the error event
+    // is still queued (otherwise we'd have _pcb).  Treat this as "not ready
+    // for a new connection".
+    async_tcp_log_d("previous connection not yet reported");
+    return false;
+  }
   if (!_start_async_task()) {
     async_tcp_log_e("failed to start task");
     return false;
   }
 
   // One pass through the LwIP context for the whole sequence; see
-  // _tcp_connect_in_context().  On failure it has already disposed of the pcb and
-  // cleared _pcb, and no callbacks were raised: we are returning failure.
+  // _tcp_connect_in_context().  On failure it has already disposed of the pcb and cleared
+  // _pcb, and no callbacks were raised.
   if (_tcp_connect(this, &addr, port) == ERR_OK) {
     return true;
   }
@@ -1241,6 +1263,15 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
     async_tcp_log_d("already connected, state %d", _pcb->state);
     return false;
   }
+  // For compatibility, calling `connect()` with a lookup outstanding supersedes
+  // the previous lookup.
+  if (_dispose_owed && !_dns_token) {
+    // The previous connection has errored out but its async event hasn't run.
+    // We can't cancel it -- it may already be pending on the async task.
+    // So we treat this as "not ready for a new connection".
+    async_tcp_log_d("previous connection not yet reported");
+    return false;
+  }
 
   if (!_start_async_task()) {
     async_tcp_log_e("failed to start task");
@@ -1266,7 +1297,7 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
   const err_t err = _tcp_dns_start(this, host, &addr, port, callback_state.get());
 
   if (err == ERR_INPROGRESS) {
-    // DNS lookup in progress
+    // DNS lookup in progress; _tcp_dns_start_api armed _dispose_owed inside the transaction
     callback_state.release();  // now tcp_dns_found's to destroy
     return true;
   }
@@ -1303,15 +1334,15 @@ void AsyncClientImpl::close() {
   const size_t pending = _rx_ack_len + _in_callback_ack_len;
   _rx_ack_len = 0;
   _in_callback_ack_len = 0;
-  int8_t err = _tcp_close(this, pending);
-  // _pcb is now NULL
-  if ((err == ERR_OK) && _discard_cb) {
-    // _pcb was closed here.  Same hazard as _error(): the application may destroy its
-    // AsyncClient from inside the callback, and close() is reached from the calling task
-    // where the facade can be the only holder.  Nothing follows the call today, so this
-    // costs nothing and stops that being load-bearing.
-    auto self = shared_from_this();
-    async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, _facade));
+  _tcp_close(this, pending);
+  // _pcb is now NULL, all queued events are cleared, and any outstanding lookup has been
+  // stood down.  Call the dispose callback if owed.
+  if (_facade && _dispose_owed) {
+    _dispose_owed = false;
+    if (_discard_cb) {
+      auto self = shared_from_this();  // ensure our object stays in scope during the callback
+      async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, _facade));
+    }
   }
 }
 
@@ -1319,9 +1350,9 @@ int8_t AsyncClientImpl::abort() {
   int8_t err = _tcp_abort(this);
   // _pcb is now NULL
   // LwIP invokes the error callback when abort is issued; preserve this semantic.
-  // This will also trigger the dispose callback.
+  // This will also trigger the dispose callback if otherwise owed (ie. error is already pending or canceling a DNS lookup).
   // If the pcb was previously invalidated by some other queued error, we've discarded that value; so we always send ERR_ABRT.
-  if (err != ERR_CONN) {
+  if (err != ERR_CONN || _dispose_owed) {
     _error(ERR_ABRT);
   }
   return err;
@@ -1399,6 +1430,7 @@ void AsyncClientImpl::ackLater() {
 // Adopt a pcb and reset all per-connection state.  Callers must already be
 // serialized against the LwIP core - called from inside a transaction, or from a callback.
 void AsyncClientImpl::_adopt(tcp_pcb *pcb) {
+  _dispose_owed = true;  // a bound pcb owes the application a terminal notification
   _pcb = pcb;
   _rx_ack_len = 0;
   _tx_last_packet = 0;
@@ -1423,11 +1455,19 @@ int8_t AsyncClientImpl::_connected(tcp_pcb *pcb, int8_t err) {
 void AsyncClientImpl::_error(int8_t err) {
   // Hold a reference to self to ensure this remains valid throughout the user callbacks.
   auto self = shared_from_this();
+  // Claim the notification before running anything: onError may destroy the AsyncClient,
+  // and ~AsyncClient() closes, which would otherwise report this same connection again.
+  const bool owed = _dispose_owed;
+  _dispose_owed = false;
   // Run error callback
   if (_error_cb) {
     async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, _facade, err));
   }
-  if (_facade && _discard_cb) {
+  // Things could have been changed under that callback:
+  // - User might have deleted the AsyncClient (_facade is now nullptr)
+  // - User might have reconnected the object (re-armed _dispose_owed)
+  // In either case, we skip the dispose.
+  if (owed && _facade && !_dispose_owed && _discard_cb) {
     async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, _facade));
   }
 }
