@@ -71,7 +71,7 @@ extern "C" {
     [[maybe_unused]]                                                   \
     const uint32_t s_time = micros();                                  \
     statement;                                                         \
-    async_tcp_log_v("%s took %" PRIu32 " us", tag, micros() - s_time); \
+    async_tcp_log_v("%s took %" PRIu32 " us", tag, static_cast<uint32_t>(micros()) - s_time); \
   }
 
 // https://github.com/espressif/arduino-esp32/issues/10526
