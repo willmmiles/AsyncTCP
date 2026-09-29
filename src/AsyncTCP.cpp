@@ -102,7 +102,7 @@ extern "C" {
   {                                                                    \
     const uint32_t s_time = micros();                                  \
     statement;                                                         \
-    async_tcp_log_v("%s took %" PRIu32 " us", tag, micros() - s_time); \
+    async_tcp_log_v("%s took %" PRIu32 " us", tag, static_cast<uint32_t>(micros()) - s_time); \
   }
 #else
 #define async_tcp_log_elapsed(tag, statement) \
