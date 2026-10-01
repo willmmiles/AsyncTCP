@@ -1,6 +1,7 @@
 // Host-native AsyncTCP tests.
 //
 //   pio test -e native                  run everything
+//   pio test -e native-asan             ... under ASan/UBSan
 //   ASYNCTCP_TEST_VERBOSE=1             also print the library's log_* output
 //   ASYNCTCP_TEST_NOFORK=1              run in-process, for a debugger
 //
@@ -24,6 +25,18 @@
 #include "mocks/mock_lwip.h"
 #include "mocks/mock_rtos.h"
 
+#if defined(__SANITIZE_ADDRESS__)
+#define ASYNCTCP_TEST_LSAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define ASYNCTCP_TEST_LSAN 1
+#endif
+#endif
+
+#ifdef ASYNCTCP_TEST_LSAN
+#include <sanitizer/lsan_interface.h>
+#endif
+
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -38,6 +51,8 @@ struct TestAbort {};
 
 // Set where there is nothing left to unwind to.  TEST_ABORT() then just returns.
 bool g_abort_returns = false;
+
+bool g_in_child = false;
 
 // Runs one stage of a test.  A failed assertion ends the stage; Unity has already
 // recorded it.
@@ -72,6 +87,19 @@ void check_invariants(void) {
   }
 }
 
+// Only in a forked child: in one process, a leak would be reported again by every later
+// test.  A test that has already failed is not reported twice.
+void check_leaks(void) {
+#ifdef ASYNCTCP_TEST_LSAN
+  if (!g_in_child || Unity.CurrentTestFailed) {
+    return;
+  }
+  if (__lsan_do_recoverable_leak_check()) {
+    UnityFail("leaked memory (see the LeakSanitizer report)", Unity.CurrentTestLineNumber);
+  }
+#endif
+}
+
 // The test UnityDefaultTestRun() is running, called through run_current_test().
 void (*g_current_test)(void) = nullptr;
 
@@ -97,12 +125,14 @@ void tearDown(void) {
 
   // Drop anything the test left behind so the next one starts clean.
   mocklwip::reset();
+
+  guarded(check_leaks);
 }
 
 namespace {
 
-// How a child process reports back, as an exit status.  Anything else means it died
-// without concluding the test.
+// How a child process reports back, as an exit status.  Anything else -- 1 from a
+// sanitizer, say -- means it died without concluding the test.
 enum ChildResult {
   CHILD_PASSED = 80,
   CHILD_FAILED = 81,
@@ -162,6 +192,7 @@ volatile int *g_printed = nullptr;
 
 UnityTally g_child_before;
 
+// _exit(), so the sanitizers' exit-time leak check cannot report the test again.
 [[noreturn]]
 void end_child(void) {
   fflush(stdout);
@@ -218,6 +249,7 @@ void asynctcp_run_test(void (*fn)(void), const char *name, int line) {
     }
 
     if (pid == 0) {
+      g_in_child = true;
       g_child_before = tally_now();
       std::set_terminate(on_terminate);
       run_test(fn, name, line);
@@ -260,6 +292,12 @@ void asynctcp_run_test(void (*fn)(void), const char *name, int line) {
 
 // Fresh allocations are filled with 0xfe, as locals are (see platformio.ini), so a value
 // read before it was written is the same on every run.
+#ifdef ASYNCTCP_TEST_LSAN
+extern "C" const char *__asan_default_options(void) {
+  return "malloc_fill_byte=254:max_malloc_fill_size=1048576";
+}
+#endif
+
 int main(void) {
 #ifdef __GLIBC__
   mallopt(M_PERTURB, 0x01);  // glibc fills with the complement
