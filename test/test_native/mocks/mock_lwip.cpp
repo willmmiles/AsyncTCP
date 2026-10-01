@@ -178,6 +178,19 @@ extern "C" u8_t pbuf_free(struct pbuf *p) {
   return freed;
 }
 
+extern "C" void pbuf_cat(struct pbuf *head, struct pbuf *tail) {
+  if (!head || !tail) {
+    return;
+  }
+  pbuf *p = head;
+  while (p->next) {
+    p->tot_len = (u16_t)(p->tot_len + tail->tot_len);
+    p = p->next;
+  }
+  p->tot_len = (u16_t)(p->tot_len + tail->tot_len);
+  p->next = tail;
+}
+
 // ===========================================================================
 // tcp
 // ===========================================================================
@@ -461,6 +474,10 @@ int mocklwip::core_lock_depth() {
 // ===========================================================================
 namespace mocklwip {
 
+const std::vector<Call> &calls() {
+  return g_calls;
+}
+
 size_t count(const char *fn) {
   size_t n = 0;
   for (const Call &c : g_calls) {
@@ -479,6 +496,15 @@ size_t count(const char *fn, const void *pcb) {
     }
   }
   return n;
+}
+
+bool saw(const char *fn, const void *pcb, long a) {
+  for (const Call &c : g_calls) {
+    if (c.fn == fn && c.pcb == pcb && c.a == a) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const Call *nth(const char *fn, size_t n) {
