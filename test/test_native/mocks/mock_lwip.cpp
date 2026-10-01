@@ -703,6 +703,20 @@ err_t fire_sent(tcp_pcb *pcb, uint16_t len) {
   return r;
 }
 
+err_t fire_poll(tcp_pcb *pcb) {
+  on_lwip_thread lwip;
+  if (!pcb || !is_live(pcb)) {
+    return ERR_ARG;
+  }
+  if (!pcb->poll) {
+    return ERR_OK;
+  }
+  const size_t mark = g_aborted.size();
+  err_t r = pcb->poll(pcb->callback_arg, pcb);
+  check_return("poll", pcb, mark, r);
+  return r;
+}
+
 tcp_pcb *fire_accept(tcp_pcb *listen_pcb, err_t err) {
   ip_addr_t peer;
   memset(&peer, 0, sizeof(peer));

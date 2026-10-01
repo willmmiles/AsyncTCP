@@ -96,6 +96,7 @@ err_t fire_recv_pbuf(tcp_pcb *pcb, pbuf *p, err_t err = 0);
 err_t fire_fin(tcp_pcb *pcb, err_t err = 0);
 
 err_t fire_sent(tcp_pcb *pcb, uint16_t len);
+err_t fire_poll(tcp_pcb *pcb);
 
 // Builds a fresh ESTABLISHED pcb and offers it to the listening pcb's
 // tcp_accept_fn. Returns the new pcb (which may already have been freed by the

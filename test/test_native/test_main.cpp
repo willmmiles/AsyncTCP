@@ -44,6 +44,7 @@
 void run_client_tests(void);
 void run_write_tests(void);
 void run_recv_tests(void);
+void run_timeout_tests(void);
 
 namespace {
 
@@ -310,6 +311,7 @@ int main(void) {
   run_client_tests();
   run_write_tests();
   run_recv_tests();
+  run_timeout_tests();
 
   UNITY_END();
 

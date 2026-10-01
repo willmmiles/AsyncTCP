@@ -5,6 +5,7 @@
 
 #include "runner.h"
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -48,16 +49,17 @@ inline tcp_pcb *listen_pcb(uint16_t port = 0) {
 // silence.
 //
 //   C onConnect   E onError   D onDisconnect   R onData
-//   A onAck
+//   A onAck                   T onTimeout
 //
 // attach() registers only the callbacks it is given -- by default the three that open and
 // end a connection -- because registering a handler can change what the library does.
 class Recorder {
 public:
   std::string seq;
-  int8_t err = 0;    // what the last onError was given
-  std::string data;  // everything onData was given, concatenated
-  size_t acked = 0;  // what the last onAck was given
+  int8_t err = 0;          // what the last onError was given
+  std::string data;        // everything onData was given, concatenated
+  size_t acked = 0;        // what the last onAck was given
+  uint32_t timed_out = 0;  // what the last onTimeout was given
 
   Recorder() = default;
   Recorder(const Recorder &) = delete;
@@ -92,11 +94,21 @@ public:
         acked = n;
       });
     }
+    if (strchr(events, 'T')) {
+      c.onTimeout([this](void *, AsyncClient *cl, uint32_t t) {
+        note('T', cl);
+        timed_out = t;
+      });
+    }
   }
 
   // Records <event> for client <c>, as the handlers attach() registers do.
   void note(char event, const AsyncClient *c, int8_t e = 0) {
     seq += event;
+  }
+
+  int count(char event) const {
+    return (int)std::count(seq.begin(), seq.end(), event);
   }
 };
 
