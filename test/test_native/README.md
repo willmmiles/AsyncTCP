@@ -259,9 +259,9 @@ the fields of `ip_addr_t`, whose layout depends on it.
 * `Accepted`: takes delivery of a server's clients and deletes whatever is left
   of them at scope exit.
 
-`python3 test/check_registration.py` (run by pre-commit) fails if a test is
-never registered, or is not named for its file: tests in `test_topic.cpp` are
-`test_topic_*`.
+`python3 test/check_registration.py` (run by pre-commit and CI) fails if a test
+is never registered, or is not named for its file: tests in `test_topic.cpp`
+are `test_topic_*`.
 
 `test_main.cpp` calls `mocklwip::reset()`, `mockrtos::reset()`, `mockclock::reset()`
 and `mockalloc::reset()` before every test, and `mocklwip::reset()` again after, so
