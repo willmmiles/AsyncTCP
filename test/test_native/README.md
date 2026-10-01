@@ -97,6 +97,7 @@ test/test_native/
     test_client.cpp         end-to-end smoke tests, one per main path
     test_write.cpp          the outbound path
     test_recv.cpp           the inbound path
+    test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -220,6 +221,7 @@ fire_recv(pcb, "data", 4);     // tcp_recv_fn with a pbuf the mock allocates
 fire_recv_pbuf(pcb, chain);    // ... or with a chain you built via make_pbuf()
 fire_fin(pcb);                 // tcp_recv_fn with a NULL pbuf
 fire_sent(pcb, 4);             // tcp_sent_fn
+fire_poll(pcb);                // tcp_poll_fn
 fire_error(pcb, ERR_RST);      // frees pcb, then tcp_err_fn -- pcb is dead after
 fire_accept(listen_pcb);       // builds a new ESTABLISHED pcb, offers it
 fire_accept(listen_pcb, peer, 41234);  // ... from the peer at that ip_addr_t and port
