@@ -19,9 +19,10 @@ extern "C" {
 #include "lwip/tcp.h"
 }
 
-const IPAddress kPeer(10, 0, 0, 1);  // where clients dial
-const uint16_t kPort = 8080;         // ... and on what port
-const uint16_t kServerPort = 8081;   // where servers listen
+const IPAddress kPeer(10, 0, 0, 1);     // where clients dial
+const uint16_t kPort = 8080;            // ... and on what port
+const uint16_t kServerPort = 8081;      // where servers listen
+const uint32_t kResolved = 0x0A000005;  // what a name lookup answers: 10.0.0.5
 
 // Connects to kPeer and completes the handshake.  Returns the client's pcb.
 inline tcp_pcb *establish(AsyncClient &c) {

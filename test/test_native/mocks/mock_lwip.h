@@ -53,6 +53,11 @@ size_t live_pbufs();
 // Everything a pcb was handed to tcp_write(), in order.
 std::string written(const tcp_pcb *pcb);
 
+// A pcb's remote IPv4 address.
+inline uint32_t remote_ip4(const tcp_pcb *pcb) {
+  return ip_addr_get_ip4_u32(&pcb->remote_ip);
+}
+
 // Empties <pcb>'s send buffer and resizes it, with the queue limit lwIP would derive
 // for that TCP_SND_BUF.  Above 65535 only with LWIP_WND_SCALE.
 void set_send_buffer(tcp_pcb *pcb, uint32_t size);
@@ -66,7 +71,7 @@ int core_lock_depth();
 struct Faults {
   err_t write_result = 0;   // ERR_OK; set ERR_MEM to fail tcp_write
   err_t output_result = 0;  // ERR_OK
-  err_t dns_result = 0;     // ERR_OK (immediate) or an error
+  err_t dns_result = 0;     // ERR_OK (immediate), ERR_INPROGRESS, or an error
   uint32_t dns_addr = 0;    // address returned for an immediate ERR_OK lookup
 };
 Faults &faults();
@@ -122,6 +127,21 @@ const char *first_unlocked_call();
 // after aborting it; lwIP would then leak the pcb or use it after free.  The first one.
 unsigned callback_return_violations();
 const char *first_callback_return_violation();
+
+// ---------------------------------------------------------------------------
+// DNS
+// ---------------------------------------------------------------------------
+// True while a dns_gethostbyname() that returned ERR_INPROGRESS is outstanding.
+bool dns_pending();
+// How many are outstanding.  LwIP cannot cancel a lookup, so they accumulate.
+size_t dns_pending_count();
+// The hostname of the oldest outstanding lookup.
+std::string dns_pending_host();
+// Fire the deferred callback with a resolved address.
+void fire_dns(uint32_t addr);
+void fire_dns(const ip_addr_t &addr);
+// Fire the deferred callback with NULL (failure / timeout).
+void fire_dns_failure();
 
 }  // namespace mocklwip
 

@@ -58,6 +58,13 @@ std::vector<const tcp_pcb *> g_aborted;  // every pcb tcp_abort() freed, in orde
 unsigned g_return_violations = 0;
 std::string g_first_return_violation;
 
+struct PendingDns {
+  std::string host;
+  dns_found_callback cb = nullptr;
+  void *arg = nullptr;
+};
+std::vector<PendingDns> g_dns_queue;  // LwIP cannot cancel a lookup, so these accumulate
+
 void rec(const char *fn, const void *pcb = nullptr, long a = 0, long b = 0) {
   g_calls.push_back(mocklwip::Call{fn, pcb, a, b});
 }
@@ -413,6 +420,14 @@ extern "C" err_t dns_gethostbyname(const char *hostname, ip_addr_t *addr, dns_fo
     }
     return ERR_OK;
   }
+  if (g_faults.dns_result == ERR_INPROGRESS) {
+    PendingDns p;
+    p.host = hostname ? hostname : "";
+    p.cb = found;
+    p.arg = callback_arg;
+    g_dns_queue.push_back(p);
+    return ERR_INPROGRESS;
+  }
   return g_faults.dns_result;
 }
 
@@ -545,6 +560,7 @@ void reset() {
   g_ports.clear();
   g_pcb_port.clear();
   g_faults = Faults{};
+  std::vector<PendingDns>().swap(g_dns_queue);
   g_reentrant_api_calls = 0;
   g_unlocked_calls = 0;
   g_first_unlocked_call.clear();
@@ -763,6 +779,51 @@ unsigned callback_return_violations() {
 
 const char *first_callback_return_violation() {
   return g_first_return_violation.c_str();
+}
+
+bool dns_pending() {
+  return !g_dns_queue.empty();
+}
+
+size_t dns_pending_count() {
+  return g_dns_queue.size();
+}
+
+std::string dns_pending_host() {
+  return g_dns_queue.empty() ? std::string() : g_dns_queue.front().host;
+}
+
+// Fires the oldest outstanding lookup, as a resolver working through its queue would.
+void fire_dns(uint32_t addr) {
+  ip_addr_t a;
+  memset(&a, 0, sizeof(a));
+  ip_addr_set_ip4_u32_val(a, addr);
+  fire_dns(a);
+}
+
+void fire_dns(const ip_addr_t &addr) {
+  on_lwip_thread lwip;
+  if (g_dns_queue.empty()) {
+    return;
+  }
+  ip_addr_t a = addr;
+  PendingDns p = g_dns_queue.front();
+  g_dns_queue.erase(g_dns_queue.begin());
+  if (p.cb) {
+    p.cb(p.host.c_str(), &a, p.arg);
+  }
+}
+
+void fire_dns_failure() {
+  on_lwip_thread lwip;
+  if (g_dns_queue.empty()) {
+    return;
+  }
+  PendingDns p = g_dns_queue.front();
+  g_dns_queue.erase(g_dns_queue.begin());
+  if (p.cb) {
+    p.cb(p.host.c_str(), nullptr, p.arg);
+  }
 }
 
 }  // namespace mocklwip
