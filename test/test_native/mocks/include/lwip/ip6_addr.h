@@ -5,6 +5,8 @@
 #include "lwip/arch.h"
 #include "lwip/opt.h"
 
+#if LWIP_IPV6
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,9 +20,12 @@ typedef struct ip6_addr ip6_addr_t;
   do {                                                                                     \
     (ip6addr)->addr[0] = (ip6addr)->addr[1] = (ip6addr)->addr[2] = (ip6addr)->addr[3] = 0; \
   } while (0)
+#define ip6_addr_isany_val(ip6addr) (((ip6addr).addr[0] == 0) && ((ip6addr).addr[1] == 0) && ((ip6addr).addr[2] == 0) && ((ip6addr).addr[3] == 0))
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif  // LWIP_IPV6
 
 #endif

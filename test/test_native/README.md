@@ -11,9 +11,13 @@ Nothing under `src/` is modified or needs to be.
 ```
 pio test -e native                  # the suite
 pio test -e native-asan             # ... under ASan/UBSan, with leak detection
+pio test -e native-no-ipv6          # ... against lwIP built for IPv4 only
+pio test -e native-no-core-locking  # ... against lwIP without core locking
 ```
 
-Each reports each test separately and exits non-zero if any fails.
+Each reports each test separately and exits non-zero if any fails. The two
+lwIP configurations change address layout and locking, not who owns what, so
+they run without the sanitizers.
 
 To work under a debugger, run the built program directly;
 `ASYNCTCP_TEST_NOFORK=1` keeps every test in one process:
@@ -158,7 +162,9 @@ on it:
   leaked listen pcb shows up as a leaked port.
 
 `tcpip_api_call(fn, msg)` calls `fn(msg)` directly on the calling thread. With
-`CONFIG_LWIP_TCPIP_CORE_LOCKING` that is what lwIP does, under the core lock.
+`CONFIG_LWIP_TCPIP_CORE_LOCKING` that is what lwIP does, under the core lock;
+without it, lwIP runs `fn` on its own thread, and there is no core lock at all,
+so `LOCK_TCPIP_CORE()` is empty and the raw API is safe only on the lwIP thread.
 
 Inside `tcpip_api_call()` and the `fire_*` helpers the mock counts as the lwIP
 thread. After every test the runner fails it if the library:
@@ -173,6 +179,9 @@ thread. After every test the runner fails it if the library:
 
 Addresses are kept in **host** byte order throughout, which keeps
 `IPAddress(10,0,0,1)` and `remote_ip4(pcb)` directly comparable.
+
+`LWIP_IPV6` defaults to 1; with it 0, as LibreTiny builds lwIP, `ip_addr_t` is
+plain `ip4_addr_t` with no `type` or `u_addr`.
 
 ## Adding a test
 
@@ -207,6 +216,10 @@ void run_topic_tests(void) {
 Include `fixtures.h`, or at least `runner.h`, rather than `<unity.h>`: `runner.h`
 is what redirects `RUN_TEST` into the forking runner. A new file's
 `run_*_tests()` has to be declared and called in `test_main.cpp`.
+
+Every configuration builds every test, so a test about IPv6 goes inside
+`#if LWIP_IPV6`, and addresses are read through `remote_ip4(pcb)` rather than
+the fields of `ip_addr_t`, whose layout depends on it.
 
 `fixtures.h` holds what most tests start with:
 
@@ -302,7 +315,7 @@ count("tcp_close", pcb)
 recved(pcb)               // total bytes handed to tcp_recved(): the window reopened
 saw("tcp_recved", pcb, 42)   // called on this pcb with first arg 42
 written(pcb)              // everything handed to tcp_write(), concatenated
-remote_ip4(pcb)           // the pcb's remote IPv4 address
+remote_ip4(pcb)           // the pcb's remote IPv4 address, with or without IPv6
 mockrtos::deadlocks()     // non-recursive mutex re-taken -- a deadlock on target
 mockclock::advance(1500)  // move millis() forward
 ```

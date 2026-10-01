@@ -18,6 +18,7 @@ typedef struct ip4_addr ip4_addr_t;
 #define ip4_addr_set_zero(ipaddr)              ((ipaddr)->addr = 0)
 #define ip4_addr_get_u32(src_ipaddr)           ((src_ipaddr)->addr)
 #define ip4_addr_set_u32(dest_ipaddr, src_u32) ((dest_ipaddr)->addr = (src_u32))
+#define ip4_addr_isany_val(addr1)              ((addr1).addr == IPADDR_ANY)
 
 #ifdef __cplusplus
 }
