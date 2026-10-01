@@ -49,6 +49,7 @@ void run_dns_tests(void);
 void run_server_listen_tests(void);
 void run_server_accept_tests(void);
 void run_server_config_tests(void);
+void run_state_tests(void);
 
 namespace {
 
@@ -320,6 +321,7 @@ int main(void) {
   run_server_listen_tests();
   run_server_accept_tests();
   run_server_config_tests();
+  run_state_tests();
 
   UNITY_END();
 
