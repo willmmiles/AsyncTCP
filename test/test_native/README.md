@@ -95,6 +95,7 @@ test/test_native/
                         listen_pcb(), Recorder, Accepted
   tests/                one file per topic; add files here, they are picked up
     test_client.cpp         end-to-end smoke tests, one per main path
+    test_state.cpp          the connection state machine and the accessors
     test_write.cpp          the outbound path
     test_recv.cpp           the inbound path
     test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
