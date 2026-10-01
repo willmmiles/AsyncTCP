@@ -99,6 +99,7 @@ test/test_native/
     test_write.cpp          the outbound path
     test_recv.cpp           the inbound path
     test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
+    test_error.cpp          how failures are reported
     test_dns.cpp            name resolution, and lookups that are abandoned
     test_server_listen.cpp  begin(), end(), status(), restarts
     test_server_accept.cpp  delivering accepted connections
@@ -131,6 +132,7 @@ on it:
   pcb alone, so the caller still owns it. (That asymmetry is what
   `test_server_listen_begin_frees_the_bound_pcb_when_listen_fails` is
   about.)
+* `tcp_connect()` failure does **not** free the pcb.
 * `tcp_write()` checks what `tcp_write_checks()` does: `ERR_CONN` outside
   `ESTABLISHED`, `CLOSE_WAIT`, `SYN_SENT` and `SYN_RCVD`; `ERR_MEM` for more than
   `tcp_sndbuf()`, or for more segments than `TCP_SND_QUEUELEN`. Segments are cut as
@@ -255,6 +257,7 @@ and then calls it with `pcb->callback_arg`.
 
 ```cpp
 faults().fail_tcp_new = 1;          // next tcp_new_ip_type() returns NULL
+faults().connect_result = ERR_RTE;  // tcp_connect() fails
 faults().bind_result = ERR_USE;
 faults().listen_returns_null = true;
 faults().close_result = ERR_MEM;    // tcp_close() fails, pcb stays allocated

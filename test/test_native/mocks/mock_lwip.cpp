@@ -325,6 +325,10 @@ extern "C" err_t tcp_connect(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t
   if (!pcb) {
     return ERR_ARG;
   }
+  if (g_faults.connect_result != ERR_OK) {
+    // lwIP does NOT free the pcb on a failed connect; the caller still owns it.
+    return g_faults.connect_result;
+  }
   if (ipaddr) {
     pcb->remote_ip = *ipaddr;
   }
