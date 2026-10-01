@@ -71,11 +71,12 @@ int core_lock_depth();
 // Failure injection. All are reset by reset().
 // ---------------------------------------------------------------------------
 struct Faults {
-  int fail_tcp_new = 0;     // >0: that many tcp_new_ip_type() calls return NULL
-  err_t bind_result = 0;    // ERR_OK
-  err_t write_result = 0;   // ERR_OK; set ERR_MEM to fail tcp_write
-  err_t output_result = 0;  // ERR_OK
-  err_t close_result = 0;   // ERR_OK; non-OK leaves the pcb allocated
+  int fail_tcp_new = 0;      // >0: that many tcp_new_ip_type() calls return NULL
+  err_t connect_result = 0;  // ERR_OK; set e.g. ERR_RTE to fail tcp_connect
+  err_t bind_result = 0;     // ERR_OK
+  err_t write_result = 0;    // ERR_OK; set ERR_MEM to fail tcp_write
+  err_t output_result = 0;   // ERR_OK
+  err_t close_result = 0;    // ERR_OK; non-OK leaves the pcb allocated
   bool listen_returns_null = false;
   err_t dns_result = 0;   // ERR_OK (immediate), ERR_INPROGRESS, or an error
   uint32_t dns_addr = 0;  // address returned for an immediate ERR_OK lookup
