@@ -50,6 +50,7 @@ void run_server_listen_tests(void);
 void run_server_accept_tests(void);
 void run_server_config_tests(void);
 void run_state_tests(void);
+void run_error_tests(void);
 
 namespace {
 
@@ -341,6 +342,7 @@ int main(int argc, char **argv) {
   run_server_accept_tests();
   run_server_config_tests();
   run_state_tests();
+  run_error_tests();
 
   if (g_list_only) {
     return 0;
