@@ -42,6 +42,7 @@
 #endif
 
 void run_client_tests(void);
+void run_write_tests(void);
 
 namespace {
 
@@ -325,6 +326,7 @@ int main(int argc, char **argv) {
   UNITY_BEGIN();
 
   run_client_tests();
+  run_write_tests();
 
   if (g_list_only) {
     return 0;
