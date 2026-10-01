@@ -42,6 +42,7 @@
 #endif
 
 void run_client_tests(void);
+void run_write_tests(void);
 
 namespace {
 
@@ -306,6 +307,7 @@ int main(void) {
   UNITY_BEGIN();
 
   run_client_tests();
+  run_write_tests();
 
   UNITY_END();
 

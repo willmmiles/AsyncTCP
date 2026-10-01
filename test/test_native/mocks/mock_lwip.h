@@ -27,6 +27,10 @@ struct Call {
   long b;           // second scalar argument (apiflags, ...)
 };
 
+size_t count(const char *fn);
+size_t count(const char *fn, const void *pcb);
+// Nth (0-based) recorded call to <fn>, or nullptr.
+const Call *nth(const char *fn, size_t n);
 // Total bytes handed to tcp_recved() for <pcb>: how much window was reopened.
 size_t recved(const tcp_pcb *pcb);
 
@@ -46,6 +50,10 @@ size_t live_pbufs();
 // Everything a pcb was handed to tcp_write(), in order.
 std::string written(const tcp_pcb *pcb);
 
+// Empties <pcb>'s send buffer and resizes it, with the queue limit lwIP would derive
+// for that TCP_SND_BUF.  Above 65535 only with LWIP_WND_SCALE.
+void set_send_buffer(tcp_pcb *pcb, uint32_t size);
+
 // How many times the TCPIP core lock is held.  0 whenever no api call is running.
 int core_lock_depth();
 
@@ -53,8 +61,10 @@ int core_lock_depth();
 // Failure injection. All are reset by reset().
 // ---------------------------------------------------------------------------
 struct Faults {
-  err_t dns_result = 0;   // ERR_OK (immediate) or an error
-  uint32_t dns_addr = 0;  // address returned for an immediate ERR_OK lookup
+  err_t write_result = 0;   // ERR_OK; set ERR_MEM to fail tcp_write
+  err_t output_result = 0;  // ERR_OK
+  err_t dns_result = 0;     // ERR_OK (immediate) or an error
+  uint32_t dns_addr = 0;    // address returned for an immediate ERR_OK lookup
 };
 Faults &faults();
 

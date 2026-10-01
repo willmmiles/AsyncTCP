@@ -95,6 +95,7 @@ test/test_native/
                         listen_pcb(), Recorder, Accepted
   tests/                one file per topic; add files here, they are picked up
     test_client.cpp         end-to-end smoke tests, one per main path
+    test_write.cpp          the outbound path
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -119,6 +120,14 @@ on it:
   so the pointer the library sees is already dangling.
 * `tcp_listen_with_backlog()` allocates a **new** listen pcb and frees the one
   passed in.
+* `tcp_write()` checks what `tcp_write_checks()` does: `ERR_CONN` outside
+  `ESTABLISHED`, `CLOSE_WAIT`, `SYN_SENT` and `SYN_RCVD`; `ERR_MEM` for more than
+  `tcp_sndbuf()`, or for more segments than `TCP_SND_QUEUELEN`. Segments are cut as
+  ESP-IDF's lwIP cuts them (one pbuf each, topped up to the MSS until `tcp_output()`),
+  and leave the queue as `fire_sent()` acks them.
+* lwIP is built with window scaling, so the send buffer is 32 bits wide and
+  `tcp_sndbuf()` saturates at 65535, as it does in lwIP. `set_send_buffer(pcb, n)`
+  resizes a pcb's.
 * A callback handed a pcb must return `ERR_ABRT` if and only if it aborted that pcb,
   as `tcp_abort()` in lwIP's `tcp.c` requires. An accept callback returning any
   other error has the new pcb aborted, as `tcp_process()` does.
@@ -220,14 +229,26 @@ To add a callback the mock does not fire yet: store the callback pointer on
 `tcp_*` setter in `mock_lwip.cpp`, and add a `fire_*` that checks `is_live(pcb)`
 and then calls it with `pcb->callback_arg`.
 
+### Injecting failures
+
+`mocklwip::faults()` returns a mutable struct, reset before each test:
+
+```cpp
+faults().write_result = ERR_MEM;
+```
+
 ### Asserting
 
 ```cpp
 live_pcbs()               // outstanding pcbs -- the leak check
 live_pbufs()
 is_live(pcb)
+count("tcp_close")        // number of calls
+count("tcp_close", pcb)
 recved(pcb)               // total bytes handed to tcp_recved(): the window reopened
 written(pcb)              // everything handed to tcp_write(), concatenated
+mockrtos::deadlocks()     // non-recursive mutex re-taken -- a deadlock on target
+mockclock::advance(1500)  // move millis() forward
 ```
 
 ## Caveats

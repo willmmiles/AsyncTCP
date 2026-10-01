@@ -4,10 +4,17 @@
 
 #include "lwip/arch.h"
 
-#define LWIP_IPV4               1
-#define LWIP_IPV6               1
-#define TCP_MSS                 1436
-#define TCP_SND_BUF             (4 * TCP_MSS)
+#define LWIP_IPV4        1
+#define LWIP_IPV6        1
+#define TCP_MSS          1436
+#define TCP_SND_BUF      (4 * TCP_MSS)
+#define TCP_SND_QUEUELEN ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
+
+// Window scaling, which ESP-IDF offers as CONFIG_LWIP_WND_SCALE, widens the send buffer
+// past 16 bits.
+#ifndef LWIP_WND_SCALE
+#define LWIP_WND_SCALE 1
+#endif
 #define LWIP_TCPIP_CORE_LOCKING 1
 
 #endif

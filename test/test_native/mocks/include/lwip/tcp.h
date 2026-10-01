@@ -39,6 +39,14 @@ enum tcp_state {
 };
 
 typedef u8_t tcpflags_t;
+
+#if LWIP_WND_SCALE
+typedef u32_t tcpwnd_size_t;
+#define TCPWND16(x) ((u16_t)((x) < 0xFFFF ? (x) : 0xFFFF))
+#else
+typedef u16_t tcpwnd_size_t;
+#define TCPWND16(x) (x)
+#endif
 #define TF_NODELAY 0x40U
 
 // SOF_* socket options, as used by AsyncClient::setKeepAlive()
@@ -58,7 +66,7 @@ struct tcp_pcb {
 
   tcpflags_t flags;
   u16_t mss;
-  u16_t snd_buf;
+  tcpwnd_size_t snd_buf;
   u16_t snd_queuelen;
 
   u32_t keep_idle;
@@ -98,7 +106,7 @@ void tcp_recved(struct tcp_pcb *pcb, u16_t len);
 
 // Real lwIP implements these as macros over pcb fields; keep that shape so tests
 // can assert on the pcb directly.
-#define tcp_sndbuf(pcb)         ((pcb)->snd_buf)
+#define tcp_sndbuf(pcb)         (TCPWND16((pcb)->snd_buf))
 #define tcp_mss(pcb)            ((pcb)->mss)
 #define tcp_nagle_disable(pcb)  ((pcb)->flags = (tcpflags_t)((pcb)->flags | TF_NODELAY))
 #define tcp_nagle_enable(pcb)   ((pcb)->flags = (tcpflags_t)((pcb)->flags & (tcpflags_t)(~TF_NODELAY)))

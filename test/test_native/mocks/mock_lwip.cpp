@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <string>
@@ -28,6 +29,22 @@ std::vector<mocklwip::Call> g_calls;
 std::set<tcp_pcb *> g_pcbs;
 std::set<pbuf *> g_pbufs;
 std::map<const tcp_pcb *, std::string> g_written;
+
+// What tcp_write() has queued on a pcb and the peer has not yet acked, one entry per
+// segment.  ESP-IDF builds lwIP with LWIP_NETIF_TX_SINGLE_PBUF, so every segment is one
+// pbuf and every write is copied.
+struct Segment {
+  u16_t len;
+  bool sent;  // handed to tcp_output(), so later writes start a new segment
+};
+struct SendQueue {
+  std::deque<Segment> segs;
+  size_t acked = 0;  // of the first segment
+  // As lwIP built with TCP_SND_BUF == size would have them.
+  tcpwnd_size_t size = TCP_SND_BUF;
+  size_t max_segs = TCP_SND_QUEUELEN;
+};
+std::map<const tcp_pcb *, SendQueue> g_sendq;
 std::set<uint16_t> g_ports;
 std::map<const tcp_pcb *, uint16_t> g_pcb_port;  // ports this pcb holds
 mocklwip::Faults g_faults;
@@ -82,6 +99,7 @@ void free_pcb(tcp_pcb *pcb) {
   }
   release_port(pcb);
   g_written.erase(pcb);
+  g_sendq.erase(pcb);
   g_pcbs.erase(pcb);
   delete pcb;
 }
@@ -260,6 +278,7 @@ extern "C" struct tcp_pcb *tcp_listen_with_backlog(struct tcp_pcb *pcb, u8_t bac
     g_pcb_port.erase(it);
   }
   g_written.erase(pcb);
+  g_sendq.erase(pcb);
   g_pcbs.erase(pcb);
   delete pcb;
   return lpcb;
@@ -310,6 +329,40 @@ extern "C" err_t tcp_write(struct tcp_pcb *pcb, const void *dataptr, u16_t len, 
   if (!pcb || !dataptr) {
     return ERR_ARG;
   }
+  if (g_faults.write_result != ERR_OK) {
+    return g_faults.write_result;
+  }
+  // tcp_write_checks()
+  if (pcb->state != ESTABLISHED && pcb->state != CLOSE_WAIT && pcb->state != SYN_SENT && pcb->state != SYN_RCVD) {
+    return ERR_CONN;
+  }
+  if (len == 0) {
+    return ERR_OK;
+  }
+  SendQueue &q = g_sendq[pcb];
+  if (len > pcb->snd_buf || pcb->snd_queuelen >= q.max_segs) {
+    return ERR_MEM;
+  }
+  // tcp_write(): top up the last unsent segment to the MSS, then add segments, failing
+  // with nothing queued if that takes more than TCP_SND_QUEUELEN.
+  u16_t topup = 0;
+  if (!q.segs.empty() && !q.segs.back().sent) {
+    topup = (u16_t)std::min<int>(pcb->mss - q.segs.back().len, len);
+  }
+  std::vector<u16_t> added;
+  for (int left = len - topup; left > 0; left -= pcb->mss) {
+    added.push_back((u16_t)std::min<int>(left, pcb->mss));
+  }
+  if (pcb->snd_queuelen + added.size() > q.max_segs) {
+    return ERR_MEM;
+  }
+  if (topup) {
+    q.segs.back().len = (u16_t)(q.segs.back().len + topup);
+  }
+  for (u16_t n : added) {
+    q.segs.push_back(Segment{n, false});
+  }
+  pcb->snd_queuelen = (u16_t)(pcb->snd_queuelen + added.size());
   g_written[pcb].append((const char *)dataptr, len);
   pcb->snd_buf -= len;
   return ERR_OK;
@@ -321,7 +374,12 @@ extern "C" err_t tcp_output(struct tcp_pcb *pcb) {
   if (!pcb) {
     return ERR_ARG;
   }
-  return ERR_OK;
+  if (g_faults.output_result == ERR_OK) {
+    for (Segment &seg : g_sendq[pcb].segs) {
+      seg.sent = true;
+    }
+  }
+  return g_faults.output_result;
 }
 
 extern "C" void tcp_recved(struct tcp_pcb *pcb, u16_t len) {
@@ -403,6 +461,35 @@ int mocklwip::core_lock_depth() {
 // ===========================================================================
 namespace mocklwip {
 
+size_t count(const char *fn) {
+  size_t n = 0;
+  for (const Call &c : g_calls) {
+    if (c.fn == fn) {
+      n++;
+    }
+  }
+  return n;
+}
+
+size_t count(const char *fn, const void *pcb) {
+  size_t n = 0;
+  for (const Call &c : g_calls) {
+    if (c.fn == fn && c.pcb == pcb) {
+      n++;
+    }
+  }
+  return n;
+}
+
+const Call *nth(const char *fn, size_t n) {
+  for (const Call &c : g_calls) {
+    if (c.fn == fn && n-- == 0) {
+      return &c;
+    }
+  }
+  return nullptr;
+}
+
 size_t recved(const tcp_pcb *pcb) {
   size_t total = 0;
   for (const Call &c : g_calls) {
@@ -428,6 +515,7 @@ void reset() {
   }
   g_pcbs.clear();
   g_written.clear();
+  g_sendq.clear();
   g_ports.clear();
   g_pcb_port.clear();
   g_faults = Faults{};
@@ -474,6 +562,13 @@ std::string written(const tcp_pcb *pcb) {
 
 Faults &faults() {
   return g_faults;
+}
+
+void set_send_buffer(tcp_pcb *pcb, uint32_t size) {
+  SendQueue &q = g_sendq[pcb];
+  q.size = (tcpwnd_size_t)size;
+  q.max_segs = (4 * size + (TCP_MSS - 1)) / TCP_MSS;  // lwIP's default TCP_SND_QUEUELEN
+  pcb->snd_buf = (tcpwnd_size_t)size;
 }
 
 pbuf *make_pbuf(const void *data, size_t len) {
@@ -561,7 +656,18 @@ err_t fire_sent(tcp_pcb *pcb, uint16_t len) {
   if (!pcb || !is_live(pcb)) {
     return ERR_ARG;
   }
-  pcb->snd_buf = (u16_t)((pcb->snd_buf + len > TCP_SND_BUF) ? TCP_SND_BUF : pcb->snd_buf + len);
+  // tcp_receive(): a segment leaves the queue once all of it is acked.
+  SendQueue &q = g_sendq[pcb];
+  pcb->snd_buf = (pcb->snd_buf + len > q.size) ? q.size : pcb->snd_buf + len;
+  q.acked += len;
+  while (!q.segs.empty() && q.acked >= q.segs.front().len) {
+    q.acked -= q.segs.front().len;
+    q.segs.pop_front();
+    pcb->snd_queuelen--;
+  }
+  if (q.segs.empty()) {
+    q.acked = 0;
+  }
   if (!pcb->sent) {
     return ERR_OK;
   }
