@@ -100,6 +100,7 @@ test/test_native/
     test_recv.cpp           the inbound path
     test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
     test_error.cpp          how failures are reported
+    test_dispose.cpp        one connection, one terminal notification
     test_dns.cpp            name resolution, and lookups that are abandoned
     test_server_listen.cpp  begin(), end(), status(), restarts
     test_server_accept.cpp  delivering accepted connections
