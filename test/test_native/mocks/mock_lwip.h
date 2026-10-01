@@ -27,8 +27,11 @@ struct Call {
   long b;           // second scalar argument (apiflags, ...)
 };
 
+const std::vector<Call> &calls();
 size_t count(const char *fn);
 size_t count(const char *fn, const void *pcb);
+// True if <fn> was called on <pcb> with first scalar argument == a.
+bool saw(const char *fn, const void *pcb, long a);
 // Nth (0-based) recorded call to <fn>, or nullptr.
 const Call *nth(const char *fn, size_t n);
 // Total bytes handed to tcp_recved() for <pcb>: how much window was reopened.
@@ -87,6 +90,8 @@ void fire_error(tcp_pcb *pcb, err_t err);
 
 // Delivers <len> bytes to tcp_recv_fn. Allocates the pbuf for you.
 err_t fire_recv(tcp_pcb *pcb, const void *data, size_t len, err_t err = 0);
+// Delivers an already-built pbuf chain (ownership passes to the library).
+err_t fire_recv_pbuf(tcp_pcb *pcb, pbuf *p, err_t err = 0);
 // Remote FIN: tcp_recv_fn with a NULL pbuf.
 err_t fire_fin(tcp_pcb *pcb, err_t err = 0);
 
@@ -99,6 +104,9 @@ err_t fire_sent(tcp_pcb *pcb, uint16_t len);
 // local address is the listener's.
 tcp_pcb *fire_accept(tcp_pcb *listen_pcb, err_t err = 0);
 tcp_pcb *fire_accept(tcp_pcb *listen_pcb, const ip_addr_t &peer, uint16_t port, err_t err = 0);
+
+// Convenience: build a pbuf holding <len> bytes of <data>.
+pbuf *make_pbuf(const void *data, size_t len);
 
 // Non-zero if the library made an api call while standing on the LwIP thread, which on a
 // real target would deadlock.
