@@ -5,6 +5,8 @@
 #include "lwip/arch.h"
 #include "lwip/opt.h"
 
+#if LWIP_IPV6
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,5 +24,7 @@ typedef struct ip6_addr ip6_addr_t;
 #ifdef __cplusplus
 }
 #endif
+
+#endif  // LWIP_IPV6
 
 #endif

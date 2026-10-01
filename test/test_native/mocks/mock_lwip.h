@@ -56,7 +56,7 @@ bool port_is_bound(uint16_t port);
 // Everything a pcb was handed to tcp_write(), in order.
 std::string written(const tcp_pcb *pcb);
 
-// A pcb's remote IPv4 address.
+// A pcb's remote IPv4 address, whether or not lwIP is built with IPv6.
 inline uint32_t remote_ip4(const tcp_pcb *pcb) {
   return ip_addr_get_ip4_u32(&pcb->remote_ip);
 }

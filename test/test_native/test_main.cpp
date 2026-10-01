@@ -2,6 +2,8 @@
 //
 //   pio test -e native                  run everything
 //   pio test -e native-asan             ... under ASan/UBSan
+//   pio test -e native-no-ipv6          ... against IPv4-only lwIP
+//   pio test -e native-no-core-locking  ... without the TCPIP core lock
 //   ASYNCTCP_TEST_VERBOSE=1             also print the library's log_* output
 //   ASYNCTCP_TEST_NOFORK=1              run in-process, for a debugger
 //

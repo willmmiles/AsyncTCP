@@ -1,6 +1,6 @@
 // Host-native mock of lwip/ip_addr.h.
-// As in lwIP built with both IPv4 and IPv6, ip_addr_t is a tagged union of the
-// two families.
+// As in lwIP, ip_addr_t is a tagged union of the two families when both are
+// enabled, and plain ip4_addr_t when only IPv4 is.
 #ifndef MOCK_LWIP_IP_ADDR_H
 #define MOCK_LWIP_IP_ADDR_H
 
@@ -18,6 +18,8 @@ enum lwip_ip_addr_type {
   IPADDR_TYPE_V6 = 6U,
   IPADDR_TYPE_ANY = 46U
 };
+
+#if LWIP_IPV4 && LWIP_IPV6
 
 typedef struct ip_addr {
   union {
@@ -54,6 +56,23 @@ typedef struct ip_addr {
   { {{{u32val, 0, 0, 0}}}, IPADDR_TYPE_V4 }
 #define IPADDR6_INIT(a, b, c, d) \
   { {{{a, b, c, d}}}, IPADDR_TYPE_V6 }
+
+#else  // LWIP_IPV4 && LWIP_IPV6
+
+typedef ip4_addr_t ip_addr_t;
+
+#define IP_SET_TYPE_VAL(ipaddr, iptype)
+#define IP_SET_TYPE(ipaddr, iptype)
+
+#define ip_2_ip4(ipaddr)                     (ipaddr)
+#define ip_addr_get_ip4_u32(ipaddr)          ip4_addr_get_u32(ip_2_ip4(ipaddr))
+#define ip_addr_set_ip4_u32(ipaddr, val)     ip4_addr_set_u32(ip_2_ip4(ipaddr), val)
+#define ip_addr_set_ip4_u32_val(ipaddr, val) ip_addr_set_ip4_u32(&(ipaddr), val)
+
+#define IPADDR4_INIT(u32val) \
+  { u32val }
+
+#endif  // LWIP_IPV4 && LWIP_IPV6
 
 #ifdef __cplusplus
 }

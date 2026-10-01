@@ -476,6 +476,10 @@ extern "C" err_t tcpip_api_call(tcpip_api_call_fn fn, struct tcpip_api_call_data
   ++g_on_lwip_thread;
   err_t r = fn(call);
   --g_on_lwip_thread;
+#if !LWIP_TCPIP_CORE_LOCKING
+  // The LwIP thread ran fn and posts its result back.
+  call->err = r;
+#endif
   return r;
 }
 
@@ -827,9 +831,11 @@ tcp_pcb *fire_accept(tcp_pcb *listen_pcb, const ip_addr_t &peer, uint16_t port, 
   tcp_pcb *newpcb = alloc_pcb();
   newpcb->state = ESTABLISHED;
   newpcb->local_ip = listen_pcb->local_ip;
+#if LWIP_IPV6
   if (listen_pcb->local_ip.type == IPADDR_TYPE_ANY) {
     newpcb->local_ip.type = peer.type;  // a dual-stack listener answers in the peer's family
   }
+#endif
   newpcb->local_port = listen_pcb->local_port;
   newpcb->remote_ip = peer;
   newpcb->remote_port = port;
