@@ -101,6 +101,7 @@ test/test_native/
     test_dns.cpp            name resolution, and lookups that are abandoned
     test_server_listen.cpp  begin(), end(), status(), restarts
     test_server_accept.cpp  delivering accepted connections
+    test_server_config.cpp  setNoDelay()
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
