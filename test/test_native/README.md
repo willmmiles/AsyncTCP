@@ -108,6 +108,7 @@ test/test_native/
     test_server_listen.cpp  begin(), end(), status(), restarts
     test_server_accept.cpp  delivering accepted connections
     test_server_config.cpp  setNoDelay()
+    test_alloc.cpp          each lwIP callback when the library cannot allocate
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -117,9 +118,10 @@ test/test_native/
       lwip/priv/tcpip_priv.h
     mock_lwip.h/.cpp    mock lwIP stack + its test-facing control API
     mock_rtos.h/.cpp    FreeRTOS, mock clock, logging, the pump
+    mock_alloc.h/.cpp   nothrow operator new, which tests can make fail
 ```
 
-`mock_lwip.h` and `mock_rtos.h` are for tests only; the library never sees them.
+`mock_lwip.h`, `mock_rtos.h` and `mock_alloc.h` are for tests only; the library never sees them.
 
 ## What the mock lwIP models
 
@@ -145,6 +147,10 @@ on it:
 * lwIP is built with window scaling, so the send buffer is 32 bits wide and
   `tcp_sndbuf()` saturates at 65535, as it does in lwIP. `set_send_buffer(pcb, n)`
   resizes a pcb's.
+* Data the recv callback refuses (anything but `ERR_OK` or `ERR_ABRT`) stays on the
+  pcb and is offered again by `retry_refused()`, or before the next segment; until it
+  is taken, later segments are dropped. A FIN is reported once, whatever the callback
+  returns.
 * A callback handed a pcb must return `ERR_ABRT` if and only if it aborted that pcb,
   as `tcp_abort()` in lwIP's `tcp.c` requires. An accept callback returning any
   other error has the new pcb aborted, as `tcp_process()` does.
@@ -220,8 +226,8 @@ is what redirects `RUN_TEST` into the forking runner. A new file's
 is never registered, or is not named for its file: tests in `test_topic.cpp`
 are `test_topic_*`.
 
-`test_main.cpp` calls `mocklwip::reset()`, `mockrtos::reset()` and
-`mockclock::reset()` before every test, and `mocklwip::reset()` again after, so
+`test_main.cpp` calls `mocklwip::reset()`, `mockrtos::reset()`, `mockclock::reset()`
+and `mockalloc::reset()` before every test, and `mocklwip::reset()` again after, so
 each test starts from zero pcbs, zero pbufs, no faults and `millis() == 1000`. A
 test about `millis() == 0` sets it with `mockclock::set_millis(0)`.
 
@@ -241,6 +247,7 @@ fire_connected(pcb, ERR_OK);   // tcp_connected_fn; moves pcb to ESTABLISHED
 fire_recv(pcb, "data", 4);     // tcp_recv_fn with a pbuf the mock allocates
 fire_recv_pbuf(pcb, chain);    // ... or with a chain you built via make_pbuf()
 fire_fin(pcb);                 // tcp_recv_fn with a NULL pbuf
+retry_refused(pcb);            // offers refused data again
 fire_sent(pcb, 4);             // tcp_sent_fn
 fire_poll(pcb);                // tcp_poll_fn
 fire_error(pcb, ERR_RST);      // frees pcb, then tcp_err_fn -- pcb is dead after
@@ -271,6 +278,16 @@ faults().close_result = ERR_MEM;    // tcp_close() fails, pcb stays allocated
 faults().write_result = ERR_MEM;
 faults().dns_result = ERR_INPROGRESS;  // or ERR_OK / an error
 faults().dns_addr = 0x0A000005;        // used when dns_result == ERR_OK
+```
+
+The library allocates with `new (std::nothrow)`; nothing else in the program does, so
+`mockalloc` fails only the library's allocations:
+
+```cpp
+mockalloc::fail_next();       // the next one returns nullptr
+mockalloc::fail_nth(2);       // ... or the one after
+mockalloc::fail_nth(3, 2);    // ... or the third and fourth
+mockalloc::failures()         // how many have failed
 ```
 
 ### Asserting

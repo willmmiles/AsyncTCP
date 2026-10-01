@@ -22,6 +22,7 @@
 #include <unistd.h>
 #endif
 
+#include "mocks/mock_alloc.h"
 #include "mocks/mock_lwip.h"
 #include "mocks/mock_rtos.h"
 
@@ -55,6 +56,7 @@ void run_dispose_tests(void);
 void run_lifetime_tests(void);
 void run_callback_tests(void);
 void run_context_tests(void);
+void run_alloc_tests(void);
 
 namespace {
 
@@ -79,6 +81,7 @@ void reset_mocks(void) {
   mocklwip::reset();
   mockrtos::reset();
   mockclock::reset();
+  mockalloc::reset();
   // As on a target that has been up a while.  A test about millis() == 0 sets it itself.
   mockclock::set_millis(1000);
 }
@@ -332,6 +335,7 @@ int main(void) {
   run_lifetime_tests();
   run_callback_tests();
   run_context_tests();
+  run_alloc_tests();
 
   UNITY_END();
 

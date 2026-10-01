@@ -7,6 +7,7 @@
 //   * tcp_listen_with_backlog() frees the old pcb and returns a NEW one on
 //     success, and returns NULL *without* freeing on failure
 //   * a fatal error frees the pcb before the error callback sees it
+//   * data the recv callback refuses stays with lwIP and is offered again
 //   * a callback handed a pcb returns ERR_ABRT exactly when it aborted that pcb
 // Those are exactly the edges AsyncTCP's lifetime handling gets wrong or right.
 
@@ -107,6 +108,10 @@ tcp_pcb *alloc_pcb() {
 void free_pcb(tcp_pcb *pcb) {
   if (!pcb) {
     return;
+  }
+  // tcp_pcb_purge()
+  if (pcb->refused_data) {
+    pbuf_free(pcb->refused_data);
   }
   release_port(pcb);
   g_written.erase(pcb);
@@ -689,6 +694,28 @@ void fire_error(tcp_pcb *pcb, err_t err) {
   }
 }
 
+// tcp_process_refused_data()
+err_t retry_refused(tcp_pcb *pcb) {
+  on_lwip_thread lwip;
+  if (!pcb || !is_live(pcb) || !pcb->refused_data) {
+    return ERR_OK;
+  }
+  pbuf *p = pcb->refused_data;
+  pcb->refused_data = nullptr;
+  if (!pcb->recv) {
+    pbuf_free(p);
+    return ERR_OK;
+  }
+  const size_t mark = g_aborted.size();
+  err_t r = pcb->recv(pcb->callback_arg, pcb, p, ERR_OK);
+  check_return("recv", pcb, mark, r);
+  if (r != ERR_OK && r != ERR_ABRT && is_live(pcb)) {
+    pcb->refused_data = p;
+    return ERR_INPROGRESS;
+  }
+  return r;
+}
+
 err_t fire_recv_pbuf(tcp_pcb *pcb, pbuf *p, err_t err) {
   on_lwip_thread lwip;
   if (!pcb || !is_live(pcb)) {
@@ -696,6 +723,17 @@ err_t fire_recv_pbuf(tcp_pcb *pcb, pbuf *p, err_t err) {
       pbuf_free(p);
     }
     return ERR_ARG;
+  }
+  // tcp_input(): refused data goes first, and while it is still refused a new segment is
+  // dropped for the peer to send again.
+  if (pcb->refused_data) {
+    err_t r = retry_refused(pcb);
+    if (r != ERR_OK) {
+      if (p) {
+        pbuf_free(p);
+      }
+      return r;
+    }
   }
   if (!pcb->recv) {
     if (p) {
@@ -706,6 +744,10 @@ err_t fire_recv_pbuf(tcp_pcb *pcb, pbuf *p, err_t err) {
   const size_t mark = g_aborted.size();
   err_t r = pcb->recv(pcb->callback_arg, pcb, p, err);
   check_return("recv", pcb, mark, r);
+  // tcp_input(): anything but ERR_OK or ERR_ABRT leaves the pbuf with lwIP.
+  if (r != ERR_OK && r != ERR_ABRT && is_live(pcb)) {
+    pcb->refused_data = p;
+  }
   return r;
 }
 
@@ -717,6 +759,13 @@ err_t fire_fin(tcp_pcb *pcb, err_t err) {
   on_lwip_thread lwip;
   if (!pcb || !is_live(pcb)) {
     return ERR_ARG;
+  }
+  // As for data, a FIN behind refused data is dropped until that data is taken.
+  if (pcb->refused_data) {
+    err_t r = retry_refused(pcb);
+    if (r != ERR_OK) {
+      return r;
+    }
   }
   if (pcb->state == ESTABLISHED) {
     pcb->state = CLOSE_WAIT;
