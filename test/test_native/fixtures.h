@@ -46,22 +46,83 @@ inline tcp_pcb *listen_pcb(uint16_t port = 0) {
   return nullptr;
 }
 
+// The application calling into the library, from a test body or from inside a callback.
+// Open one around each call.  Callbacks run on the async task, never inside a call, except
+// that close() and ~AsyncClient() may run the client's own onDisconnect, and abort() its
+// own onError(ERR_ABRT) then onDisconnect.
+class AppCall {
+public:
+  // <name> is what is called, on <client> if anything; <may_run> is the letters it may run
+  // for that client (see Recorder).
+  explicit AppCall(const char *name, const AsyncClient *client = nullptr, const char *may_run = "")
+    : _name(name), _client(client), _may_run(may_run), _outer(_current) {
+    _current = this;
+  }
+  ~AppCall() {
+    _current = _outer;
+  }
+  AppCall(const AppCall &) = delete;
+  AppCall &operator=(const AppCall &) = delete;
+
+  // The innermost call open, or nullptr while the library runs on its own.
+  static const AppCall *current() {
+    return _current;
+  }
+  const char *name() const {
+    return _name;
+  }
+  bool allows(char event, const AsyncClient *c, int8_t err) const {
+    if (c != _client || !strchr(_may_run, event)) {
+      return false;
+    }
+    return event != 'E' || err == ERR_ABRT;
+  }
+
+private:
+  const char *_name;
+  const AsyncClient *_client;
+  const char *_may_run;
+  const AppCall *_outer;
+  static inline const AppCall *_current = nullptr;
+};
+
+// Runs <f> as the application call <name>, which may run no callbacks.
+template<class F> auto app(const char *name, F &&f) {
+  AppCall call(name);
+  return f();
+}
+inline void app_close(AsyncClient &c) {
+  AppCall call("close", &c, "D");
+  c.close();
+}
+inline int8_t app_abort(AsyncClient &c) {
+  AppCall call("abort", &c, "ED");
+  return c.abort();
+}
+inline void app_delete(AsyncClient *c) {
+  AppCall call("~AsyncClient", c, "D");
+  delete c;
+}
+
 // Records a client's callbacks as one letter each, in the order they run, so that order,
 // count and exactly-once are one assertion: "ED" is onError then onDisconnect, "" is
 // silence.
 //
 //   C onConnect   E onError   D onDisconnect   R onData
-//   A onAck                   T onTimeout
+//   A onAck       P onPoll    T onTimeout      K onPacket, which acks the pbuf
 //
 // attach() registers only the callbacks it is given -- by default the three that open and
 // end a connection -- because registering a handler can change what the library does.
+//
+// A callback run inside an AppCall that does not allow it is added to <violations>.
 class Recorder {
 public:
   std::string seq;
   int8_t err = 0;          // what the last onError was given
-  std::string data;        // everything onData was given, concatenated
+  std::string data;        // everything onData or onPacket was given, concatenated
   size_t acked = 0;        // what the last onAck was given
   uint32_t timed_out = 0;  // what the last onTimeout was given
+  std::string violations;  // "R in write(); ..."
 
   Recorder() = default;
   Recorder(const Recorder &) = delete;
@@ -96,10 +157,23 @@ public:
         acked = n;
       });
     }
+    if (strchr(events, 'P')) {
+      c.onPoll([this](void *, AsyncClient *cl) {
+        note('P', cl);
+      });
+    }
     if (strchr(events, 'T')) {
       c.onTimeout([this](void *, AsyncClient *cl, uint32_t t) {
         note('T', cl);
         timed_out = t;
+      });
+    }
+    if (strchr(events, 'K')) {
+      c.onPacket([this](void *, AsyncClient *cl, pbuf *pb) {
+        note('K', cl);
+        data.append((const char *)pb->payload, pb->len);
+        AppCall call("ackPacket");
+        cl->ackPacket(pb);
       });
     }
   }
@@ -107,6 +181,11 @@ public:
   // Records <event> for client <c>, as the handlers attach() registers do.
   void note(char event, const AsyncClient *c, int8_t e = 0) {
     seq += event;
+    const AppCall *call = AppCall::current();
+    if (call && !call->allows(event, c, e)) {
+      violations += event;
+      violations += std::string(" in ") + call->name() + "(); ";
+    }
   }
 
   int count(char event) const {

@@ -54,6 +54,7 @@ void run_error_tests(void);
 void run_dispose_tests(void);
 void run_lifetime_tests(void);
 void run_callback_tests(void);
+void run_context_tests(void);
 
 namespace {
 
@@ -349,6 +350,7 @@ int main(int argc, char **argv) {
   run_dispose_tests();
   run_lifetime_tests();
   run_callback_tests();
+  run_context_tests();
 
   if (g_list_only) {
     return 0;
