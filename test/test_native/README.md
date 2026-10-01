@@ -113,6 +113,7 @@ test/test_native/
     test_server_accept.cpp  delivering accepted connections
     test_server_config.cpp  setNoDelay()
     test_alloc.cpp          each lwIP callback when the library cannot allocate
+    test_congestion.cpp     far more events queued than the queue is sized for
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here

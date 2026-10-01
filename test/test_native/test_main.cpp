@@ -59,6 +59,7 @@ void run_lifetime_tests(void);
 void run_callback_tests(void);
 void run_context_tests(void);
 void run_alloc_tests(void);
+void run_congestion_tests(void);
 
 namespace {
 
@@ -338,6 +339,7 @@ int main(void) {
   run_callback_tests();
   run_context_tests();
   run_alloc_tests();
+  run_congestion_tests();
 
   UNITY_END();
 
