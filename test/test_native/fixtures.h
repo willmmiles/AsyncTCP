@@ -23,6 +23,7 @@ const IPAddress kPeer(10, 0, 0, 1);     // where clients dial
 const uint16_t kPort = 8080;            // ... and on what port
 const uint16_t kServerPort = 8081;      // where servers listen
 const uint32_t kResolved = 0x0A000005;  // what a name lookup answers: 10.0.0.5
+const long kExpectedBacklog = 5;        // what a server asks lwIP for; there is no public setting
 
 // Connects to kPeer and completes the handshake.  Returns the client's pcb.
 inline tcp_pcb *establish(AsyncClient &c) {
@@ -139,6 +140,21 @@ public:
   }
   AsyncClient *operator[](size_t i) const {
     return _clients.at(i);
+  }
+  // The client holding <pcb>, or nullptr.
+  AsyncClient *holding(const tcp_pcb *pcb) const {
+    for (AsyncClient *c : _clients) {
+      if (c->pcb() == pcb) {
+        return c;
+      }
+    }
+    return nullptr;
+  }
+  // Deletes the i-th client now.
+  void drop(size_t i) {
+    AsyncClient *c = _clients.at(i);
+    _clients.erase(_clients.begin() + i);
+    delete c;
   }
   void clear() {
     std::vector<AsyncClient *> doomed;

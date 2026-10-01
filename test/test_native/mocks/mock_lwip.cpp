@@ -770,6 +770,9 @@ tcp_pcb *fire_accept(tcp_pcb *listen_pcb, const ip_addr_t &peer, uint16_t port, 
   tcp_pcb *newpcb = alloc_pcb();
   newpcb->state = ESTABLISHED;
   newpcb->local_ip = listen_pcb->local_ip;
+  if (listen_pcb->local_ip.type == IPADDR_TYPE_ANY) {
+    newpcb->local_ip.type = peer.type;  // a dual-stack listener answers in the peer's family
+  }
   newpcb->local_port = listen_pcb->local_port;
   newpcb->remote_ip = peer;
   newpcb->remote_port = port;
@@ -781,6 +784,15 @@ tcp_pcb *fire_accept(tcp_pcb *listen_pcb, const ip_addr_t &peer, uint16_t port, 
     abort_pcb(newpcb);
   }
   return newpcb;
+}
+
+void fire_accept_failure(tcp_pcb *listen_pcb, err_t err) {
+  on_lwip_thread lwip;
+  if (!listen_pcb || !is_live(listen_pcb) || !listen_pcb->accept) {
+    return;
+  }
+  rec("accept_offered", nullptr, err);
+  listen_pcb->accept(listen_pcb->callback_arg, nullptr, err);
 }
 
 unsigned reentrant_api_calls() {

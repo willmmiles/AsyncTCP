@@ -100,6 +100,7 @@ test/test_native/
     test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
     test_dns.cpp            name resolution, and lookups that are abandoned
     test_server_listen.cpp  begin(), end(), status(), restarts
+    test_server_accept.cpp  delivering accepted connections
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -234,6 +235,7 @@ fire_poll(pcb);                // tcp_poll_fn
 fire_error(pcb, ERR_RST);      // frees pcb, then tcp_err_fn -- pcb is dead after
 fire_accept(listen_pcb);       // builds a new ESTABLISHED pcb, offers it
 fire_accept(listen_pcb, peer, 41234);  // ... from the peer at that ip_addr_t and port
+fire_accept_failure(listen_pcb);       // ... or NULL with ERR_MEM, as when no pcb is free
 fire_dns(0x0A000005);          // deferred dns_found_callback with an address
 fire_dns(addr);                // ... or with any ip_addr_t, IPv6 included
 fire_dns_failure();            // ... or with NULL
