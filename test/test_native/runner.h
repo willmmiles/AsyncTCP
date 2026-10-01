@@ -2,7 +2,7 @@
 //
 // The tests themselves are ordinary Unity. This only changes how they are called:
 // each one runs in a forked child, so a crash costs one test rather than the rest of
-// the run. Unity leaves RUN_TEST overridable for exactly this.
+// the run, and the sanitizers' leak check reports against the test that leaked. Unity leaves RUN_TEST overridable for exactly this.
 //
 // Include this instead of <unity.h>.
 #ifndef ASYNCTCP_TEST_RUNNER_H
