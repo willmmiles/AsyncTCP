@@ -50,6 +50,7 @@ bool is_live(const tcp_pcb *pcb);
 tcp_pcb *dialled_pcb();
 size_t live_pbufs();
 // Ports currently held by a bound or listening pcb.
+std::vector<uint16_t> bound_ports();
 bool port_is_bound(uint16_t port);
 
 // Everything a pcb was handed to tcp_write(), in order.

@@ -51,6 +51,7 @@ void run_server_accept_tests(void);
 void run_server_config_tests(void);
 void run_state_tests(void);
 void run_error_tests(void);
+void run_dispose_tests(void);
 
 namespace {
 
@@ -324,6 +325,7 @@ int main(void) {
   run_server_config_tests();
   run_state_tests();
   run_error_tests();
+  run_dispose_tests();
 
   UNITY_END();
 

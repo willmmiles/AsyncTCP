@@ -619,6 +619,10 @@ size_t live_pbufs() {
   return g_pbufs.size();
 }
 
+std::vector<uint16_t> bound_ports() {
+  return std::vector<uint16_t>(g_ports.begin(), g_ports.end());
+}
+
 bool port_is_bound(uint16_t port) {
   return g_ports.count(port) != 0;
 }
