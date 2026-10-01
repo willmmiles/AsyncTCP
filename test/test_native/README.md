@@ -10,9 +10,10 @@ Nothing under `src/` is modified or needs to be.
 
 ```
 pio test -e native                  # the suite
+pio test -e native-asan             # ... under ASan/UBSan, with leak detection
 ```
 
-It reports each test separately and exits non-zero if any fails.
+Each reports each test separately and exits non-zero if any fails.
 
 To work under a debugger, run the built program directly;
 `ASYNCTCP_TEST_NOFORK=1` keeps every test in one process:
@@ -27,7 +28,9 @@ ASYNCTCP_TEST_NOFORK=1 gdb .pio/build/native/program
 
 `test_main.cpp` runs every test in a child process. A test that segfaults then
 costs one red result instead of the rest of the run -- which matters, because the
-bugs this suite is aimed at tend to crash rather than to fail an assertion.
+bugs this suite is aimed at tend to crash rather than to fail an assertion. It
+also lets `tearDown()` run LeakSanitizer's check on one test at a time, so a
+leak fails the test that caused it.
 
 ## How a failed assertion ends a test
 
@@ -237,4 +240,4 @@ written(pcb)              // everything handed to tcp_write(), concatenated
   the run.
 * Memory the library reads before writing holds 0xfe bytes, on the stack and on
   the heap, so a failure that depends on it reads the same on every run. The
-  heap fill needs glibc.
+  heap fill needs glibc or ASan.
