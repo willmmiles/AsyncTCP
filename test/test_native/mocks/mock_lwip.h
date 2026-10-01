@@ -113,9 +113,13 @@ err_t fire_poll(tcp_pcb *pcb);
 // tcp_accept_fn. Returns the new pcb (which may already have been freed by the
 // library, so check is_live() before dereferencing).  As in lwIP, a return other than
 // ERR_OK or ERR_ABRT aborts the new pcb.  The peer is 10.0.0.2:40000 unless given.  The
-// local address is the listener's.
+// local address is the listener's; on a listener bound to any address, only its family
+// follows the peer's.
 tcp_pcb *fire_accept(tcp_pcb *listen_pcb, err_t err = 0);
 tcp_pcb *fire_accept(tcp_pcb *listen_pcb, const ip_addr_t &peer, uint16_t port, err_t err = 0);
+// A SYN lwIP could not allocate a pcb for: tcp_accept_fn with a NULL pcb and <err>, whose
+// return lwIP ignores.
+void fire_accept_failure(tcp_pcb *listen_pcb, err_t err = ERR_MEM);
 
 // Convenience: build a pbuf holding <len> bytes of <data>.
 pbuf *make_pbuf(const void *data, size_t len);
