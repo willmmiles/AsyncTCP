@@ -2,7 +2,9 @@
 //
 // Behavior is modeled on real lwIP wherever it matters for AsyncTCP:
 //   * tcp_abort() frees the pcb and *then* runs the error callback
-//   * tcp_listen_with_backlog() frees the old pcb and returns a NEW one
+//   * tcp_close() frees the pcb only when it returns ERR_OK
+//   * tcp_listen_with_backlog() frees the old pcb and returns a NEW one on
+//     success, and returns NULL *without* freeing on failure
 //   * a fatal error frees the pcb before the error callback sees it
 //   * a callback handed a pcb returns ERR_ABRT exactly when it aborted that pcb
 // Those are exactly the edges AsyncTCP's lifetime handling gets wrong or right.
@@ -203,6 +205,11 @@ extern "C" void pbuf_cat(struct pbuf *head, struct pbuf *tail) {
 // ===========================================================================
 extern "C" struct tcp_pcb *tcp_new_ip_type(u8_t type) {
   check_context("tcp_new_ip_type");
+  if (g_faults.fail_tcp_new > 0) {
+    g_faults.fail_tcp_new--;
+    rec("tcp_new_ip_type", nullptr, type);
+    return nullptr;
+  }
   tcp_pcb *pcb = alloc_pcb();
   IP_SET_TYPE_VAL(pcb->local_ip, type);
   IP_SET_TYPE_VAL(pcb->remote_ip, type);
@@ -264,6 +271,9 @@ extern "C" err_t tcp_bind(struct tcp_pcb *pcb, const ip_addr_t *ipaddr, u16_t po
   if (!pcb) {
     return ERR_ARG;
   }
+  if (g_faults.bind_result != ERR_OK) {
+    return g_faults.bind_result;
+  }
   if (port == 0) {
     port = g_next_ephemeral++;
   }
@@ -283,6 +293,11 @@ extern "C" struct tcp_pcb *tcp_listen_with_backlog(struct tcp_pcb *pcb, u8_t bac
   check_context("tcp_listen_with_backlog");
   rec("tcp_listen_with_backlog", pcb, backlog);
   if (!pcb) {
+    return nullptr;
+  }
+  if (g_faults.listen_returns_null) {
+    // Real lwIP leaves the caller's pcb alone when it cannot allocate the
+    // listen pcb. Whoever called us still owns it.
     return nullptr;
   }
   // Real lwIP swaps the pcb for a smaller listen pcb and frees the original.
@@ -330,6 +345,9 @@ extern "C" err_t tcp_close(struct tcp_pcb *pcb) {
   rec("tcp_close", pcb, pcb ? (long)pcb->state : -1);
   if (!pcb) {
     return ERR_ARG;
+  }
+  if (g_faults.close_result != ERR_OK) {
+    return g_faults.close_result;  // pcb stays allocated, as on the target
   }
   free_pcb(pcb);
   return ERR_OK;
@@ -595,6 +613,10 @@ tcp_pcb *dialled_pcb() {
 
 size_t live_pbufs() {
   return g_pbufs.size();
+}
+
+bool port_is_bound(uint16_t port) {
+  return g_ports.count(port) != 0;
 }
 
 std::string written(const tcp_pcb *pcb) {
