@@ -43,6 +43,7 @@
 
 void run_client_tests(void);
 void run_write_tests(void);
+void run_recv_tests(void);
 
 namespace {
 
@@ -308,6 +309,7 @@ int main(void) {
 
   run_client_tests();
   run_write_tests();
+  run_recv_tests();
 
   UNITY_END();
 

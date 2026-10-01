@@ -34,6 +34,7 @@ struct pbuf {
 
 struct pbuf *pbuf_alloc(pbuf_layer l, u16_t length, pbuf_type type);
 u8_t pbuf_free(struct pbuf *p);
+void pbuf_cat(struct pbuf *head, struct pbuf *tail);
 
 #ifdef __cplusplus
 }

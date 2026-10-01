@@ -96,6 +96,7 @@ test/test_native/
   tests/                one file per topic; add files here, they are picked up
     test_client.cpp         end-to-end smoke tests, one per main path
     test_write.cpp          the outbound path
+    test_recv.cpp           the inbound path
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -216,6 +217,7 @@ whole point — it is where the queue-handling bugs live.
 ```cpp
 fire_connected(pcb, ERR_OK);   // tcp_connected_fn; moves pcb to ESTABLISHED
 fire_recv(pcb, "data", 4);     // tcp_recv_fn with a pbuf the mock allocates
+fire_recv_pbuf(pcb, chain);    // ... or with a chain you built via make_pbuf()
 fire_fin(pcb);                 // tcp_recv_fn with a NULL pbuf
 fire_sent(pcb, 4);             // tcp_sent_fn
 fire_error(pcb, ERR_RST);      // frees pcb, then tcp_err_fn -- pcb is dead after
@@ -246,6 +248,7 @@ is_live(pcb)
 count("tcp_close")        // number of calls
 count("tcp_close", pcb)
 recved(pcb)               // total bytes handed to tcp_recved(): the window reopened
+saw("tcp_recved", pcb, 42)   // called on this pcb with first arg 42
 written(pcb)              // everything handed to tcp_write(), concatenated
 mockrtos::deadlocks()     // non-recursive mutex re-taken -- a deadlock on target
 mockclock::advance(1500)  // move millis() forward
