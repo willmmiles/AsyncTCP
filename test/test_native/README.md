@@ -98,6 +98,7 @@ test/test_native/
     test_write.cpp          the outbound path
     test_recv.cpp           the inbound path
     test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
+    test_dns.cpp            name resolution, and lookups that are abandoned
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -150,6 +151,9 @@ thread. After every test the runner fails it if the library:
   else for one it had, which would leave lwIP using a freed pcb or dropping a live
   one.
 
+Addresses are kept in **host** byte order throughout, which keeps
+`IPAddress(10,0,0,1)` and `remote_ip4(pcb)` directly comparable.
+
 ## Adding a test
 
 Add it to the file for its topic, or drop a new `.cpp` in `tests/`; PlatformIO
@@ -186,8 +190,8 @@ is what redirects `RUN_TEST` into the forking runner. A new file's
 
 `fixtures.h` holds what most tests start with:
 
-* `kPeer`, `kPort`, `kServerPort`: where clients dial and where servers
-  listen;
+* `kPeer`, `kPort`, `kServerPort`, `kResolved`: where clients dial, where
+  servers listen, what a lookup answers;
 * `establish(c)`: connects `c` and delivers the handshake, returning its pcb;
 * `listen_pcb(port)`: the listening pcb, on `port` or on any port;
 * `Recorder`: records a client's callbacks as a string, one letter each, so
@@ -225,6 +229,9 @@ fire_poll(pcb);                // tcp_poll_fn
 fire_error(pcb, ERR_RST);      // frees pcb, then tcp_err_fn -- pcb is dead after
 fire_accept(listen_pcb);       // builds a new ESTABLISHED pcb, offers it
 fire_accept(listen_pcb, peer, 41234);  // ... from the peer at that ip_addr_t and port
+fire_dns(0x0A000005);          // deferred dns_found_callback with an address
+fire_dns(addr);                // ... or with any ip_addr_t, IPv6 included
+fire_dns_failure();            // ... or with NULL
 asynctcp_test_pump();          // now the application callbacks run
 ```
 
@@ -239,6 +246,8 @@ and then calls it with `pcb->callback_arg`.
 
 ```cpp
 faults().write_result = ERR_MEM;
+faults().dns_result = ERR_INPROGRESS;  // or ERR_OK / an error
+faults().dns_addr = 0x0A000005;        // used when dns_result == ERR_OK
 ```
 
 ### Asserting
@@ -252,6 +261,7 @@ count("tcp_close", pcb)
 recved(pcb)               // total bytes handed to tcp_recved(): the window reopened
 saw("tcp_recved", pcb, 42)   // called on this pcb with first arg 42
 written(pcb)              // everything handed to tcp_write(), concatenated
+remote_ip4(pcb)           // the pcb's remote IPv4 address
 mockrtos::deadlocks()     // non-recursive mutex re-taken -- a deadlock on target
 mockclock::advance(1500)  // move millis() forward
 ```
