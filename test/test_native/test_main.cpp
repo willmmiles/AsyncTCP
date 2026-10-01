@@ -53,6 +53,7 @@ void run_state_tests(void);
 void run_error_tests(void);
 void run_dispose_tests(void);
 void run_lifetime_tests(void);
+void run_callback_tests(void);
 
 namespace {
 
@@ -328,6 +329,7 @@ int main(void) {
   run_error_tests();
   run_dispose_tests();
   run_lifetime_tests();
+  run_callback_tests();
 
   UNITY_END();
 
