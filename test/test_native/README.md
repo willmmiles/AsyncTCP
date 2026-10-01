@@ -92,7 +92,7 @@ test/test_native/
   test_main.cpp         the runner: per-test reset, forking, Unity reporting
   asynctcp.cpp          the library under test, compiled into the test program
   fixtures.h            what most tests share: the peer and ports, establish(),
-                        listen_pcb(), Recorder, Accepted
+                        listen_pcb(), AppCall, Recorder, Accepted
   tests/                one file per topic; add files here, they are picked up
     test_client.cpp         end-to-end smoke tests, one per main path
     test_state.cpp          the connection state machine and the accessors
@@ -104,6 +104,7 @@ test/test_native/
     test_dns.cpp            name resolution, and lookups that are abandoned
     test_lifetime.cpp       destroying a client at awkward moments
     test_callback.cpp       what each handler is handed
+    test_context.cpp        callbacks run on the async task, not inside calls
     test_server_listen.cpp  begin(), end(), status(), restarts
     test_server_accept.cpp  delivering accepted connections
     test_server_config.cpp  setNoDelay()
@@ -209,6 +210,9 @@ is what redirects `RUN_TEST` into the forking runner. A new file's
 * `listen_pcb(port)`: the listening pcb, on `port` or on any port;
 * `Recorder`: records a client's callbacks as a string, one letter each, so
   order, count and exactly-once are one assertion;
+* `AppCall`, `app()`, `app_close()`, `app_abort()`, `app_delete()`: mark a call
+  the application makes into the library, so a `Recorder` notes in
+  `violations` any callback run inside it that the call may not run;
 * `Accepted`: takes delivery of a server's clients and deletes whatever is left
   of them at scope exit.
 
