@@ -44,6 +44,7 @@
 void run_client_tests(void);
 void run_write_tests(void);
 void run_recv_tests(void);
+void run_timeout_tests(void);
 
 namespace {
 
@@ -329,6 +330,7 @@ int main(int argc, char **argv) {
   run_client_tests();
   run_write_tests();
   run_recv_tests();
+  run_timeout_tests();
 
   if (g_list_only) {
     return 0;
