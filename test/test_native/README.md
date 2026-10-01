@@ -102,6 +102,7 @@ test/test_native/
     test_error.cpp          how failures are reported
     test_dispose.cpp        one connection, one terminal notification
     test_dns.cpp            name resolution, and lookups that are abandoned
+    test_lifetime.cpp       destroying a client at awkward moments
     test_server_listen.cpp  begin(), end(), status(), restarts
     test_server_accept.cpp  delivering accepted connections
     test_server_config.cpp  setNoDelay()
