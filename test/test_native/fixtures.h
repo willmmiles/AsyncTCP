@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "AsyncTCP.h"
+#include "mocks/mock_alloc.h"
 #include "mocks/mock_lwip.h"
 #include "mocks/mock_rtos.h"
 

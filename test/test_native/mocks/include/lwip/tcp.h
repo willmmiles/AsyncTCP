@@ -79,6 +79,8 @@ struct tcp_pcb {
   tcp_poll_fn poll;
   tcp_err_fn errf;
   tcp_accept_fn accept;
+
+  struct pbuf *refused_data;  // what the recv callback last refused
 };
 
 struct tcp_pcb *tcp_new_ip_type(u8_t type);

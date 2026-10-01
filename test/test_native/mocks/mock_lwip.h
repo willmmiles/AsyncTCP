@@ -102,11 +102,20 @@ err_t fire_connected(tcp_pcb *pcb, err_t err = 0);
 void fire_error(tcp_pcb *pcb, err_t err);
 
 // Delivers <len> bytes to tcp_recv_fn. Allocates the pbuf for you.
+//
+// As in lwIP, if the callback returns anything but ERR_OK or ERR_ABRT, the pbuf stays
+// with lwIP as the pcb's refused data, to be offered again by retry_refused() or before
+// the next segment.  Until it is taken, later segments are dropped: the peer sends them
+// again.
 err_t fire_recv(tcp_pcb *pcb, const void *data, size_t len, err_t err = 0);
 // Delivers an already-built pbuf chain (ownership passes to the library).
 err_t fire_recv_pbuf(tcp_pcb *pcb, pbuf *p, err_t err = 0);
-// Remote FIN: tcp_recv_fn with a NULL pbuf.
+// Remote FIN: tcp_recv_fn with a NULL pbuf.  lwIP reports it once, whatever the
+// callback returns.
 err_t fire_fin(tcp_pcb *pcb, err_t err = 0);
+// Offers refused data again, as lwIP's fast timer does.  ERR_OK once it is taken (or if
+// there was none), ERR_INPROGRESS if it is refused again.
+err_t retry_refused(tcp_pcb *pcb);
 
 err_t fire_sent(tcp_pcb *pcb, uint16_t len);
 err_t fire_poll(tcp_pcb *pcb);
