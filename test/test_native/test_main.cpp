@@ -46,6 +46,7 @@ void run_write_tests(void);
 void run_recv_tests(void);
 void run_timeout_tests(void);
 void run_dns_tests(void);
+void run_server_listen_tests(void);
 
 namespace {
 
@@ -314,6 +315,7 @@ int main(void) {
   run_recv_tests();
   run_timeout_tests();
   run_dns_tests();
+  run_server_listen_tests();
 
   UNITY_END();
 

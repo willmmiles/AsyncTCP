@@ -99,6 +99,7 @@ test/test_native/
     test_recv.cpp           the inbound path
     test_timeout.cpp        the rx and ack timeouts, onPoll, keepalive
     test_dns.cpp            name resolution, and lookups that are abandoned
+    test_server_listen.cpp  begin(), end(), status(), restarts
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -121,8 +122,12 @@ on it:
   `ERR_ABRT` (except on `LISTEN` pcbs).
 * A fatal error (`fire_error`) frees the pcb **before** the error callback runs,
   so the pointer the library sees is already dangling.
-* `tcp_listen_with_backlog()` allocates a **new** listen pcb and frees the one
-  passed in.
+* `tcp_close()` frees the pcb only when it returns `ERR_OK`.
+* `tcp_listen_with_backlog()` on success allocates a **new** listen pcb and
+  frees the one passed in; on failure it returns `NULL` and leaves the caller's
+  pcb alone, so the caller still owns it. (That asymmetry is what
+  `test_server_listen_begin_frees_the_bound_pcb_when_listen_fails` is
+  about.)
 * `tcp_write()` checks what `tcp_write_checks()` does: `ERR_CONN` outside
   `ESTABLISHED`, `CLOSE_WAIT`, `SYN_SENT` and `SYN_RCVD`; `ERR_MEM` for more than
   `tcp_sndbuf()`, or for more segments than `TCP_SND_QUEUELEN`. Segments are cut as
@@ -245,6 +250,10 @@ and then calls it with `pcb->callback_arg`.
 `mocklwip::faults()` returns a mutable struct, reset before each test:
 
 ```cpp
+faults().fail_tcp_new = 1;          // next tcp_new_ip_type() returns NULL
+faults().bind_result = ERR_USE;
+faults().listen_returns_null = true;
+faults().close_result = ERR_MEM;    // tcp_close() fails, pcb stays allocated
 faults().write_result = ERR_MEM;
 faults().dns_result = ERR_INPROGRESS;  // or ERR_OK / an error
 faults().dns_addr = 0x0A000005;        // used when dns_result == ERR_OK
@@ -255,6 +264,7 @@ faults().dns_addr = 0x0A000005;        // used when dns_result == ERR_OK
 ```cpp
 live_pcbs()               // outstanding pcbs -- the leak check
 live_pbufs()
+port_is_bound(8080)
 is_live(pcb)
 count("tcp_close")        // number of calls
 count("tcp_close", pcb)
