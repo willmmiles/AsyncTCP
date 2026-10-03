@@ -1521,6 +1521,13 @@ int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint16_t len) {
 
 int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
   while (pb != NULL) {
+    // Ensure the object is still valid and the pcb we're processing for is still the one held.
+    // The callback (or other user code) could close the connection, destroy the client, or
+    // replace the connection outright while we're in the loop.
+    if (_pcb != pcb || !_facade) {
+      break;
+    }
+
     _rx_last_packet = millis();
     // we should not ack before we assimilate the data
     _ack_pcb = true;
@@ -1550,13 +1557,6 @@ int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
         }
         _in_callback_ack_len = 0;
       }
-    }
-    // Stop if the callback closed the connection, destroyed the client, or replaced the
-    // connection outright - a callback that reconnects leaves _pcb non-null but pointing
-    // at a different peer, and the rest of this chain belongs to the old one.  Comparing
-    // against the pcb the data arrived on covers all three.
-    if (_pcb != pcb || !_facade) {
-      break;
     }
   }
   if (pb) {
