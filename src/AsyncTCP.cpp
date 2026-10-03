@@ -1542,9 +1542,11 @@ int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
     _rx_last_packet = millis();
     // we should not ack before we assimilate the data
     _ack_pcb = true;
+    // Inline pbuf pop, similar to pbuf_dechain
     pbuf *b = pb;
     pb = b->next;
     b->next = NULL;
+    b->tot_len = b->len;
     if (_pb_cb) {
       // The callback owns b now, and must ackPacket() or free it
       async_tcp_log_elapsed("onPacket", _pb_cb(_pb_cb_arg, _facade, b));
