@@ -98,10 +98,10 @@ extern "C" {
  */
 #if defined(CONFIG_ASYNC_TCP_DEBUG) || defined(CONFIG_ASYNC_TCP_LOG_CUSTOM) || (defined(CORE_DEBUG_LEVEL) && (CORE_DEBUG_LEVEL >= 5)) \
   || (defined(LOG_LOCAL_LEVEL) && (LOG_LOCAL_LEVEL >= 5))
-#define async_tcp_log_elapsed(tag, statement)                          \
-  {                                                                    \
-    const uint32_t s_time = micros();                                  \
-    statement;                                                         \
+#define async_tcp_log_elapsed(tag, statement)                                                 \
+  {                                                                                           \
+    const uint32_t s_time = micros();                                                         \
+    statement;                                                                                \
     async_tcp_log_v("%s took %" PRIu32 " us", tag, static_cast<uint32_t>(micros()) - s_time); \
   }
 #else
