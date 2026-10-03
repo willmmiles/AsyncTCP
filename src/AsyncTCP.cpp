@@ -1512,11 +1512,17 @@ void AsyncClientImpl::_error(int8_t err) {
 }
 
 int8_t AsyncClientImpl::_fin(tcp_pcb *pcb, int8_t err) {
+  if (_pcb != pcb) {
+    return ERR_CONN;
+  }
   close();
   return ERR_OK;
 }
 
 int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint16_t len) {
+  if (_pcb != pcb) {
+    return ERR_CONN;
+  }
   _rx_last_ack = _rx_last_packet = millis();
   if (_sent_cb) {
     async_tcp_log_elapsed("onAck", _sent_cb(_sent_cb_arg, _facade, len, (_rx_last_packet - _tx_last_packet)));
