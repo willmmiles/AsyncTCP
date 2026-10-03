@@ -246,15 +246,12 @@ public:
   static void __attribute__((visibility("internal"))) tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg);
 };
 
-// Guard class for the global queue
 namespace {
-
+// Global queue mutex
 static SemaphoreHandle_t _async_queue_mutex = nullptr;
 
-// The queue is only reachable through an AsyncClient or an AsyncServer, so creating the
-// mutex in their constructors puts it ahead of every user.  Unsynchronized, in the same
-// way _start_async_task() always has been: the first of those can only be constructed by
-// application code, before the async task exists and before LwIP points at anything.
+// Created by _start_async_task(), which every path that can queue an event passes first.
+// Unsynchronized, as _start_async_task() always has been.
 static bool _init_queue_mutex() {
   if (!_async_queue_mutex) {
     _async_queue_mutex = xSemaphoreCreateMutex();
@@ -265,6 +262,7 @@ static bool _init_queue_mutex() {
   return _async_queue_mutex != nullptr;
 }
 
+// Guard class for the global queue
 class queue_mutex_guard {
   bool holds_mutex;
 
@@ -445,9 +443,7 @@ public:
 class AsyncServerImpl : public std::enable_shared_from_this<AsyncServerImpl> {
 public:
   AsyncServerImpl(AsyncServer *facade, ip_addr_t addr, uint16_t port)
-    : _pcb(nullptr), _epoch(0), _facade(facade), _addr(addr), _port(port), _noDelay(false), _connect_cb(nullptr), _connect_cb_arg(nullptr) {
-    _init_queue_mutex();
-  }
+    : _pcb(nullptr), _epoch(0), _facade(facade), _addr(addr), _port(port), _noDelay(false), _connect_cb(nullptr), _connect_cb_arg(nullptr) {}
   ~AsyncServerImpl() {
     // end() here would be wrong for the same reason ~AsyncClientImpl does not close: the
     // last reference can be dropped by a purge on the LwIP thread, and end() is a
@@ -582,6 +578,12 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
 }
 
 static size_t _remove_events_for_client(AsyncClientImpl *client, lwip_tcp_event_packet_t *terminal_event = nullptr) {
+  if (!_async_queue_mutex) {
+    // Never started, so nothing can have been queued.  A terminal event comes from an
+    // LwIP callback, and a bound pcb implies a started task.
+    ASYNCTCP_ASSERT(!terminal_event);
+    return 0;
+  }
   lwip_tcp_event_packet_t *removed_event_chain;
   {
     queue_mutex_guard guard;
@@ -1162,7 +1164,6 @@ AsyncClientImpl::~AsyncClientImpl() {
 }
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>(this)) {
-  _init_queue_mutex();
   if (pcb) {
     // The pcb's callbacks queue events, so the task must be there to take them.
     if (_start_async_task()) {
