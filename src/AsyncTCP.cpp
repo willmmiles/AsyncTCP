@@ -1646,14 +1646,17 @@ void AsyncClientImpl::setAckTimeout(uint32_t timeout) {
 }
 
 void AsyncClientImpl::setNoDelay(bool nodelay) const {
-  if (!_pcb) {
-    return;
-  }
-  if (nodelay) {
-    tcp_nagle_disable(_pcb);
-  } else {
-    tcp_nagle_enable(_pcb);
-  }
+  with_tcp_core_lock([&]() {
+    if (!_pcb) {
+      return ERR_CONN;
+    }
+    if (nodelay) {
+      tcp_nagle_disable(_pcb);
+    } else {
+      tcp_nagle_enable(_pcb);
+    }
+    return ERR_OK;
+  });
 }
 
 bool AsyncClientImpl::getNoDelay() {
@@ -1664,18 +1667,21 @@ bool AsyncClientImpl::getNoDelay() {
 }
 
 void AsyncClientImpl::setKeepAlive(uint32_t ms, uint8_t cnt) {
-  if (!_pcb) {
-    return;
-  }
-  if (ms != 0) {
-    _pcb->so_options |= SOF_KEEPALIVE;  // Turn on TCP Keepalive for the given pcb
-    // Set the time between keepalive messages in milli-seconds
-    _pcb->keep_idle = ms;
-    _pcb->keep_intvl = ms;
-    _pcb->keep_cnt = cnt;  // The number of unanswered probes required to force closure of the socket
-  } else {
-    _pcb->so_options &= ~SOF_KEEPALIVE;  // Turn off TCP Keepalive for the given pcb
-  }
+  with_tcp_core_lock([&]() {
+    if (!_pcb) {
+      return ERR_CONN;
+    }
+    if (ms != 0) {
+      _pcb->so_options |= SOF_KEEPALIVE;  // Turn on TCP Keepalive for the given pcb
+      // Set the time between keepalive messages in milli-seconds
+      _pcb->keep_idle = ms;
+      _pcb->keep_intvl = ms;
+      _pcb->keep_cnt = cnt;  // The number of unanswered probes required to force closure of the socket
+    } else {
+      _pcb->so_options &= ~SOF_KEEPALIVE;  // Turn off TCP Keepalive for the given pcb
+    }
+    return ERR_OK;
+  });
 }
 
 uint16_t AsyncClientImpl::getMss() const {
@@ -2347,13 +2353,19 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
     return ERR_ABRT;
   }
 
+  // Apply our nodelay setting
+  if (server->_noDelay) {
+    tcp_nagle_disable(pcb);
+  } else {
+    tcp_nagle_enable(pcb);
+  }
+
   // Allocate and initialize the AsyncClient implementation for this accepted connection.
   // The facade will be constructed by the async task when it processes this event -- if the connection
   // errors out prior to accept running, the event will be discarded and the implementation destroyed
   // as there's no API to inform the server of the error.
   e->impl = std::make_shared<AsyncClientImpl>(nullptr);
   e->impl->_adopt(pcb);
-  e->impl->setNoDelay(server->_noDelay);
   e->server = server->shared_from_this();  // Lock server impl in scope
   e->accept.epoch = server->_epoch;        // And remember in case it's end()ed
 
