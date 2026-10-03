@@ -1621,13 +1621,7 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
  * */
 
 bool AsyncClientImpl::free() {
-  if (!_pcb) {
-    return true;
-  }
-  if (_pcb->state == CLOSED || _pcb->state > ESTABLISHED) {
-    return true;
-  }
-  return false;
+  return this->freeable();  // these are synonymous
 }
 
 size_t AsyncClientImpl::write(const char *data, size_t size, uint8_t apiflags) {
@@ -1891,10 +1885,7 @@ bool AsyncClientImpl::disconnected() const {
 }
 
 bool AsyncClientImpl::freeable() const {
-  if (!_pcb) {
-    return true;
-  }
-  return _pcb->state == CLOSED || _pcb->state > ESTABLISHED;
+  return !connecting() && !connected();
 }
 
 bool AsyncClientImpl::canSend() const {
