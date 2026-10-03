@@ -1696,14 +1696,7 @@ uint16_t AsyncClientImpl::getMss() const {
 }
 
 uint32_t AsyncClientImpl::getRemoteAddress() const {
-  if (!_pcb) {
-    return 0;
-  }
-#if LWIP_IPV4 && LWIP_IPV6
-  return _pcb->remote_ip.u_addr.ip4.addr;
-#else
-  return _pcb->remote_ip.addr;
-#endif
+  return getRemoteAddress4().addr;
 }
 
 #if LWIP_IPV6
@@ -1765,14 +1758,7 @@ uint16_t AsyncClientImpl::getRemotePort() const {
 }
 
 uint32_t AsyncClientImpl::getLocalAddress() const {
-  if (!_pcb) {
-    return 0;
-  }
-#if LWIP_IPV4 && LWIP_IPV6
-  return _pcb->local_ip.u_addr.ip4.addr;
-#else
-  return _pcb->local_ip.addr;
-#endif
+  return getLocalAddress4().addr;
 }
 
 uint16_t AsyncClientImpl::getLocalPort() const {
