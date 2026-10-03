@@ -267,7 +267,14 @@ class queue_mutex_guard {
   bool holds_mutex;
 
 public:
+  // For paths that can only run once _start_async_task() has succeeded.
   inline queue_mutex_guard() : holds_mutex(xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
+  // For paths that can run before it ever has: takes nothing if the mutex was never created,
+  // in which case nothing can have been queued and no task is reading.
+  enum if_created_t {
+    if_created
+  };
+  inline explicit queue_mutex_guard(if_created_t) : holds_mutex(_async_queue_mutex && xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
   inline ~queue_mutex_guard() {
     if (holds_mutex) {
       xSemaphoreGive(_async_queue_mutex);
@@ -578,15 +585,15 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
 }
 
 static size_t _remove_events_for_client(AsyncClientImpl *client, lwip_tcp_event_packet_t *terminal_event = nullptr) {
-  if (!_async_queue_mutex) {
-    // Never started, so nothing can have been queued.  A terminal event comes from an
-    // LwIP callback, and a bound pcb implies a started task.
-    ASYNCTCP_ASSERT(!terminal_event);
-    return 0;
-  }
   lwip_tcp_event_packet_t *removed_event_chain;
   {
-    queue_mutex_guard guard;
+    queue_mutex_guard guard(queue_mutex_guard::if_created);
+    if (!guard) {
+      // Never started, so nothing can have been queued.  A terminal event comes from an
+      // LwIP callback, and a bound pcb implies a started task.
+      ASYNCTCP_ASSERT(!terminal_event);
+      return 0;
+    }
     removed_event_chain = _async_queue.remove_if([=](lwip_tcp_event_packet_t &pkt) {
       return pkt.impl.get() == client;
     });
