@@ -1604,8 +1604,9 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
       async_tcp_log_d("ack timeout %d", state());
       if (_timeout_cb) {
         async_tcp_log_elapsed("onTimeout", _timeout_cb(_timeout_cb_arg, _facade, (now - _tx_last_packet)));
+        return ERR_OK;  // do not call poll callback
       }
-      return ERR_OK;  // do not call poll callback
+      // Otherwise fall through to poll - not sure why you'd configure a timeout without a callback
     }
   }
 
