@@ -1164,7 +1164,17 @@ AsyncClientImpl::~AsyncClientImpl() {
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>(this)) {
   _init_queue_mutex();
   if (pcb) {
-    _impl->_adopt(pcb);
+    // The pcb's callbacks queue events, so the task must be there to take them.
+    if (_start_async_task()) {
+      _impl->_adopt(pcb);
+    } else {
+      // The pcb is ours, and nothing could deliver its events.  Close rather than abort:
+      // in an accept callback, only the callback's return value can report ERR_ABRT.
+      async_tcp_log_e("failed to start task");
+      if (tcp_close(pcb) != ERR_OK) {
+        async_tcp_log_e("failed to close pcb");
+      }
+    }
   }
 }
 
