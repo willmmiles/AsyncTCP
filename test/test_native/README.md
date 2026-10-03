@@ -135,6 +135,7 @@ test/test_native/
     test_server_config.cpp  setNoDelay()
     test_alloc.cpp          each lwIP callback when the library cannot allocate
     test_congestion.cpp     far more events queued than the queue is sized for
+    test_start.cpp          when FreeRTOS cannot create the queue mutex or the task
   mocks/
     include/            fake system headers -- on the include path FIRST, so
                         #include "lwip/tcp.h" etc. resolve here
@@ -289,6 +290,7 @@ fire_error(pcb, ERR_RST);      // frees pcb, then tcp_err_fn -- pcb is dead afte
 fire_accept(listen_pcb);       // builds a new ESTABLISHED pcb, offers it
 fire_accept(listen_pcb, peer, 41234);  // ... from the peer at that ip_addr_t and port
 fire_accept_failure(listen_pcb);       // ... or NULL with ERR_MEM, as when no pcb is free
+fire_raw_accept(fn);           // a new ESTABLISHED pcb, offered to fn on the lwIP thread
 fire_dns(0x0A000005);          // deferred dns_found_callback with an address
 fire_dns(addr);                // ... or with any ip_addr_t, IPv6 included
 fire_dns_failure();            // ... or with NULL
@@ -314,6 +316,13 @@ faults().write_result = ERR_MEM;
 faults().dns_result = ERR_INPROGRESS;  // or ERR_OK / an error
 faults().dns_addr = 0x0A000005;        // used when dns_result == ERR_OK
 faults().dns_fails_inside_the_call = true;  // with ERR_INPROGRESS: answers NULL, runs the task, then returns
+```
+
+`mockrtos::faults()` does the same for FreeRTOS:
+
+```cpp
+mockrtos::faults().fail_mutex_create = true;  // xSemaphoreCreateMutex() returns NULL
+mockrtos::faults().fail_task_create = true;   // xTaskCreate() fails
 ```
 
 The library allocates with `new (std::nothrow)`; nothing else in the program does, so
@@ -350,7 +359,8 @@ mockclock::advance(1500)  // move millis() forward
 * `reset()` cannot un-start the library's async task or free its queue mutex;
   those are process-lifetime singletons in `src/AsyncTCP.cpp`. Under the default
   fork-per-test that costs nothing; under `ASYNCTCP_TEST_NOFORK=1` they persist
-  from one test to the next.
+  from one test to the next, so the tests in `test_start.cpp` that fail their
+  creation only mean anything as the first to start the library.
 * The mocks cover the API surface `src/AsyncTCP.cpp` actually uses. A change that
   reaches for more of lwIP will need them extended to match.
 * Forking is POSIX-only; elsewhere the tests run in one process and a crash ends

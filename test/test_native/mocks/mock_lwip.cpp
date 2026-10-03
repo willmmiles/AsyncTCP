@@ -872,6 +872,21 @@ void fire_accept_failure(tcp_pcb *listen_pcb, err_t err) {
   listen_pcb->accept(listen_pcb->callback_arg, nullptr, err);
 }
 
+tcp_pcb *fire_raw_accept(const std::function<err_t(tcp_pcb *)> &accept) {
+  on_lwip_thread lwip;
+  tcp_pcb *newpcb = alloc_pcb();
+  newpcb->state = ESTABLISHED;
+  ip_addr_set_ip4_u32_val(newpcb->remote_ip, 0x0A000002);  // 10.0.0.2
+  newpcb->remote_port = 40000;
+  rec("accept_offered", newpcb, ERR_OK);
+  const size_t mark = g_aborted.size();
+  err_t r = accept(newpcb);
+  if (!check_return("accept", newpcb, mark, r) && r != ERR_OK && r != ERR_ABRT && is_live(newpcb)) {
+    abort_pcb(newpcb);
+  }
+  return newpcb;
+}
+
 unsigned reentrant_api_calls() {
   return g_reentrant_api_calls;
 }

@@ -60,6 +60,7 @@ void run_callback_tests(void);
 void run_context_tests(void);
 void run_alloc_tests(void);
 void run_congestion_tests(void);
+void run_start_tests(void);
 
 namespace {
 
@@ -359,6 +360,7 @@ int main(int argc, char **argv) {
   run_context_tests();
   run_alloc_tests();
   run_congestion_tests();
+  run_start_tests();
 
   if (g_list_only) {
     return 0;

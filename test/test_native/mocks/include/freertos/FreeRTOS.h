@@ -17,6 +17,8 @@ typedef size_t configSTACK_DEPTH_TYPE;
 #define pdTRUE  ((BaseType_t)1)
 #define pdPASS  pdTRUE
 
+#define errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY ((BaseType_t)(-1))
+
 #define portMAX_DELAY ((TickType_t)0xffffffffUL)
 
 #define pdMS_TO_TICKS(xTimeInMs) ((TickType_t)(xTimeInMs))
