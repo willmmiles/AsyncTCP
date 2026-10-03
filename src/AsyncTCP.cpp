@@ -439,7 +439,9 @@ public:
 
   _facade is the orphan indicator.  ~AsyncServer() clears it, and a queued connection that
   finds it null is dropped as though it never arrived.  A connection accepted before end()
-  is dropped too, on the epoch rather than on _pcb - see below.
+  is dropped too, on the epoch rather than on _pcb - see below.  Both are checked when the
+  connection is dequeued; one already dequeued is delivered, as a client's event is after
+  close().
 
   One consequence of outliving the facade: the last reference can be dropped by a purge on
   the LwIP thread, so this object's destructor - and with it the application's onClient
@@ -468,12 +470,12 @@ public:
   /*
     Which listening session we are on.  Bumped in LwIP context in end() to ensure any pending
     connections do not get mishandled if a client should call end() then begin() before LwIP
-    can dispatch them.
+    can dispatch them.  Written under both the LwIP lock and the queue mutex, so tcp_accept()
+    and the dequeue can each read it under the one they hold.
   */
   uint32_t _epoch;
 
-  // Cleared by ~AsyncServer().  Read without a lock on the async task, on the same terms
-  // as AsyncClientImpl::_facade - see the note there.
+  // Cleared by ~AsyncServer() under the queue mutex, and read under it at dequeue.
   AsyncServer *_facade;
 
   // Not synchronized: set up before begin() and read afterwards.
@@ -524,14 +526,26 @@ static inline void _prepend_async_event(lwip_tcp_event_packet_t *e) {
 
 static inline lwip_tcp_event_packet_t *_get_async_event() {
   lwip_tcp_event_packet_t *result = nullptr;
-  // Discarded events are freed once the mutex is released, to keep pbuf_free() out of
-  // the critical section.
+  // Discarded events are disposed of once the mutex is released, to keep pbuf_free() and
+  // close() out of the critical section.
   lwip_tcp_event_packet_t *discarded = nullptr;
 
   {
     queue_mutex_guard guard;
     while (1) {
       lwip_tcp_event_packet_t *e = _async_queue.pop_front();
+
+      if (e && (e->event == LWIP_TCP_ACCEPT)) {
+        // Decided here, under the lock end() and ~AsyncServer() take to change these.
+        AsyncServerImpl *server = e->server.get();
+        const bool wanted = server && server->_facade                // the application still has this server
+                            && (server->_epoch == e->accept.epoch);  // ...and has not stopped listening since
+        if (!wanted) {
+          e->next = discarded;
+          discarded = e;
+          continue;
+        }
+      }
 
       if ((!e) || (e->event != LWIP_TCP_POLL)) {
         result = e;
@@ -579,6 +593,10 @@ static inline lwip_tcp_event_packet_t *_get_async_event() {
   while (discarded) {
     auto t = discarded;
     discarded = t->next;
+    if (t->event == LWIP_TCP_ACCEPT) {
+      // Never delivered, so no callbacks; this also purges anything queued behind it.
+      t->impl->close();
+    }
     _free_event(t);
   }
   return result;
@@ -618,15 +636,13 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
   if (e->event == LWIP_TCP_ACCEPT) {
     // Accept is checked first because we need to handle it before the client facade check,
     // since we haven't constructed a facade for it yet.
-    AsyncServerImpl *server = e->server.get();
-    const bool wanted = server && server->_facade               // the application still has this server
-                        && (server->_epoch == e->accept.epoch)  // ...and has not stopped listening since
-                        && e->impl->_pcb;                       // ...and the connection is still up
-    AsyncClient *c = wanted ? new (std::nothrow) AsyncClient(e->impl) : nullptr;
+    // Unwanted connections were discarded at dequeue.  One that errored before then had this
+    // event purged; one that errors from there on is delivered, and its error event follows.
+    AsyncClient *c = new (std::nothrow) AsyncClient(e->impl);
     if (c) {
-      server->_accepted(c);
+      e->server->_accepted(c);
     } else {
-      e->impl->close();  // Not wanted or failed to create a client facade
+      e->impl->close();  // Failed to create a client facade
     }
   } else if ((e->impl->_facade == NULL)) {
     // A detached implementation has no facade to hand to the user's callbacks, so its
@@ -2200,6 +2216,7 @@ AsyncServer::~AsyncServer() {
   _impl->end();
   // Detach: a connection accepted but not yet delivered still points at the implementation,
   // and this is how it learns there is no longer a server to hand it to.
+  queue_mutex_guard guard(queue_mutex_guard::if_created);
   _impl->_facade = nullptr;
 }
 
@@ -2295,7 +2312,9 @@ void AsyncServerImpl::end() {
       _pcb = NULL;  // PCB is now the property of LwIP
     }
     // Disown anything already accepted on the session we just closed.  Bumped inside the
-    // transaction, so it is ordered against tcp_accept() rather than racing it.
+    // transaction, so it is ordered against tcp_accept() rather than racing it, and under
+    // the queue mutex, so it is ordered against the dequeue.
+    queue_mutex_guard guard(queue_mutex_guard::if_created);
     ++_epoch;
     return ERR_OK;
   });
