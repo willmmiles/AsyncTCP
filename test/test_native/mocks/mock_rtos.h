@@ -43,6 +43,13 @@ unsigned deadlocks();
 // any occurrence as a test failure.
 unsigned null_semaphores();
 
+// Failure injection. Reset by reset().
+struct Faults {
+  bool fail_mutex_create = false;  // xSemaphoreCreateMutex() returns NULL
+  bool fail_task_create = false;   // xTaskCreate() fails and starts nothing
+};
+Faults &faults();
+
 }  // namespace mockrtos
 
 namespace mockclock {

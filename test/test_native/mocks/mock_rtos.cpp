@@ -84,10 +84,14 @@ struct MockSemaphore {
 std::set<MockSemaphore *> g_semaphores;
 unsigned g_deadlocks = 0;
 unsigned g_null_semaphores = 0;
+mockrtos::Faults g_faults;
 
 }  // namespace
 
 extern "C" SemaphoreHandle_t xSemaphoreCreateMutex(void) {
+  if (g_faults.fail_mutex_create) {
+    return nullptr;
+  }
   MockSemaphore *s = new MockSemaphore{false, 0};
   g_semaphores.insert(s);
   return (SemaphoreHandle_t)s;
@@ -135,6 +139,9 @@ int g_task_handle_storage = 0;  // address used as the fake TaskHandle_t
 bool g_in_pump = false;
 
 BaseType_t create_task(TaskFunction_t fn, void *param, TaskHandle_t *handle) {
+  if (g_faults.fail_task_create) {
+    return errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY;  // and *handle is left alone
+  }
   g_task_fn = fn;
   g_task_param = param;
   if (handle) {
@@ -213,9 +220,14 @@ void reset() {
   // stateless.
   g_deadlocks = 0;
   g_null_semaphores = 0;
+  g_faults = Faults{};
   for (MockSemaphore *s : g_semaphores) {
     s->depth = 0;
   }
+}
+
+Faults &faults() {
+  return g_faults;
 }
 
 unsigned null_semaphores() {

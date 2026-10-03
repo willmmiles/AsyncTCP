@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -131,6 +132,10 @@ tcp_pcb *fire_accept(tcp_pcb *listen_pcb, const ip_addr_t &peer, uint16_t port, 
 // A SYN lwIP could not allocate a pcb for: tcp_accept_fn with a NULL pcb and <err>, whose
 // return lwIP ignores.
 void fire_accept_failure(tcp_pcb *listen_pcb, err_t err = ERR_MEM);
+// Builds a fresh ESTABLISHED pcb from 10.0.0.2:40000 and offers it to <accept> on the LwIP
+// thread, as to an accept callback the application registered with lwIP itself.  Returns
+// the new pcb, as fire_accept() does, and treats the return the same way.
+tcp_pcb *fire_raw_accept(const std::function<err_t(tcp_pcb *)> &accept);
 
 // Convenience: build a pbuf holding <len> bytes of <data>.
 pbuf *make_pbuf(const void *data, size_t len);
