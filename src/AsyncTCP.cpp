@@ -1583,24 +1583,26 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
 
   uint32_t now = millis();
 
+  // RX Timeout
+  if (_rx_timeout && (now - _rx_last_packet) >= (_rx_timeout * 1000)) {
+    async_tcp_log_d("rx timeout %d", state());
+    close();
+    return ERR_OK;  // connection is now closed; don't call poll callback
+  }
+
   // ACK Timeout
   if (_ack_timeout) {
     const uint32_t one_day = 86400000;
     bool last_tx_is_after_last_ack = (_rx_last_ack - _tx_last_packet + one_day) < one_day;
     if (last_tx_is_after_last_ack && (now - _tx_last_packet) >= _ack_timeout) {
-      async_tcp_log_d("ack timeout %d", pcb->state);
+      async_tcp_log_d("ack timeout %d", state());
       if (_timeout_cb) {
         async_tcp_log_elapsed("onTimeout", _timeout_cb(_timeout_cb_arg, _facade, (now - _tx_last_packet)));
       }
-      return ERR_OK;
+      return ERR_OK;  // do not call poll callback
     }
   }
-  // RX Timeout
-  if (_rx_timeout && (now - _rx_last_packet) >= (_rx_timeout * 1000)) {
-    async_tcp_log_d("rx timeout %d", pcb->state);
-    close();
-    return ERR_OK;
-  }
+
   // Everything is fine
   if (_poll_cb) {
     async_tcp_log_elapsed("onPoll", _poll_cb(_poll_cb_arg, _facade));
