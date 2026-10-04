@@ -1398,7 +1398,8 @@ int8_t AsyncClientImpl::abort() {
 }
 
 size_t AsyncClientImpl::space() const {
-  if ((_pcb != NULL) && (_pcb->state == ESTABLISHED)) {
+  auto st = state();
+  if (st == ESTABLISHED || st == CLOSE_WAIT) {
     return tcp_sndbuf(_pcb);
   }
   return 0;
