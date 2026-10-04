@@ -149,6 +149,10 @@ public:
 
   /**
      * @brief send data previously add()'ed
+     * @note Data queued with add() will be sent on LwIP's internal timer as well; calling send() triggers
+     *  an immediate flush.  It is possible that queued data may have already been sent by the time send()
+     *  is executed.  send() failures do not clear previously add()ed data; it remains queued and the send
+     *  will be retried on the next timer cycle.
      *
      * @return true on success
      * @return false on error
@@ -163,7 +167,7 @@ public:
      * @param data
      * @param size
      * @param apiflags
-     * @return size_t
+     * @return size_t amount of data that has been copied
      */
   size_t write(const char *data, size_t size, uint8_t apiflags = ASYNC_WRITE_FLAG_COPY);
 
@@ -194,7 +198,7 @@ public:
   void setRxTimeout(uint32_t timeout);
 
   uint32_t getAckTimeout() const;
-  // no ACK timeout for the last sent packet in milliseconds
+  // no ACK timeout for the send() call in milliseconds
   void setAckTimeout(uint32_t timeout);
 
   void setNoDelay(bool nodelay) const;

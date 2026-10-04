@@ -210,6 +210,7 @@ struct lwip_tcp_event_packet_t {
     struct {
       tcp_pcb *pcb;
       uint16_t len;
+      uint32_t time;
     } sent;
     struct {
       tcp_pcb *pcb;
@@ -354,7 +355,7 @@ public:
   uint32_t _rx_ack_len;
   uint32_t _rx_last_packet;
   uint32_t _rx_timeout;
-  uint32_t _rx_last_ack;
+  uint32_t _ack_since;  // ack timer; 0 = idle
   uint32_t _ack_timeout;
   uint32_t _in_callback_ack_len;  // bytes handed to onData but not yet acked
 
@@ -425,9 +426,15 @@ public:
   int8_t _connected(tcp_pcb *pcb, int8_t err);
   void _error(int8_t err);
   int8_t _poll(tcp_pcb *pcb);
-  int8_t _sent(tcp_pcb *pcb, uint16_t len);
+  int8_t _sent(tcp_pcb *pcb, uint16_t len, uint32_t time);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
+
+  // Add and send internal implementations; must be called in LwIP context
+  // These are called out to share code with write(), but allow the whole
+  // sequence to go in a single LwIP lock transaction.
+  size_t _add_locked(const char *data, size_t size, uint8_t apiflags);
+  err_t _send_locked();
 };
 
 /*
@@ -657,7 +664,7 @@ void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
     e->impl->_fin(e->fin.pcb, e->fin.err);
   } else if (e->event == LWIP_TCP_SENT) {
     // ets_printf("-S: 0x%08x\n", e->sent.pcb);
-    e->impl->_sent(e->sent.pcb, e->sent.len);
+    e->impl->_sent(e->sent.pcb, e->sent.len, e->sent.time);
   } else if (e->event == LWIP_TCP_POLL) {
     // ets_printf("-P: 0x%08x\n", e->poll.pcb);
     e->impl->_poll(e->poll.pcb);
@@ -785,6 +792,7 @@ static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   }
   e->connected.pcb = pcb;
   e->connected.err = err;
+  client->_rx_last_packet = millis();
   queue_mutex_guard guard;
   _send_async_event(e);
   return ERR_OK;
@@ -827,6 +835,7 @@ int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb
     async_tcp_log_e("Failed to allocate event packet");
     return ERR_MEM;
   }
+  client->_rx_last_packet = millis();
   if (pb) {
     // ets_printf("+R: 0x%08x\n", pcb);
     e->recv.pcb = pcb;
@@ -854,6 +863,14 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   }
   e->sent.pcb = pcb;
   e->sent.len = len;
+  uint32_t now = millis();
+  e->sent.time = now - client->_tx_last_packet;
+  // Update timeout tracking
+  if (client->_ack_since) {
+    // Re-arm the timer if we've still got outstanding data; otherwise cancel it
+    client->_ack_since = (tcp_sndqueuelen(pcb) ? (now - (now == 0)) : 0);
+  }
+  client->_rx_last_packet = now;
 
   queue_mutex_guard guard;
   _send_async_event(e);
@@ -958,25 +975,6 @@ typedef struct {
     } dns;
   };
 } tcp_api_call_t;
-
-static err_t _tcp_output_api(struct tcpip_api_call_data *api_call_msg) {
-  tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
-  msg->err = ERR_CONN;
-  if (msg->client->_pcb) {
-    msg->err = tcp_output(msg->client->_pcb);
-  }
-  return msg->err;
-}
-
-static esp_err_t _tcp_output(AsyncClientImpl *client) {
-  if (!client->_pcb) {
-    return ERR_CONN;
-  }
-  tcp_api_call_t msg;
-  msg.client = client;
-  tcpip_api_call(_tcp_output_api, (struct tcpip_api_call_data *)&msg);
-  return msg.err;
-}
 
 static err_t _tcp_recved_api(struct tcpip_api_call_data *api_call_msg) {
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
@@ -1182,7 +1180,7 @@ static err_t _tcp_dns_start(AsyncClientImpl *client, const char *host, ip_addr_t
 AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
   : _pcb(nullptr), _connect_port(0), _dns_token(nullptr), _dispose_owed(false), _facade(facade), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0),
     _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0),
-    _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _rx_last_ack(0),
+    _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _ack_since(0),
     _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _in_callback_ack_len(0) {}
 
 AsyncClientImpl::~AsyncClientImpl() {
@@ -1405,35 +1403,65 @@ size_t AsyncClientImpl::space() const {
   return 0;
 }
 
-size_t AsyncClientImpl::add(const char *data, size_t size, uint8_t apiflags) {
-  if (!_pcb || size == 0 || data == NULL) {
-    return 0;
-  }
-  // Early check outside of lock
-  if (space() == 0) {
-    return 0;
-  }
-  auto err = with_tcp_core_lock([&]() -> err_t {
-    if (!_pcb) {
-      return ERR_CONN;
-    }
-    size = std::min(size, space());
-    return tcp_write(_pcb, data, size, apiflags);
-  });
-  if (err != ERR_OK) {
+// Callers must hold the TCP core lock
+size_t AsyncClientImpl::_add_locked(const char *data, size_t size, uint8_t apiflags) {
+  size = std::min(size, space());
+  if (size == 0 || tcp_write(_pcb, data, size, apiflags) != ERR_OK) {
     return 0;
   }
   return size;
 }
 
-bool AsyncClientImpl::send() {
-  auto backup = _tx_last_packet;
-  _tx_last_packet = millis();
-  if (_tcp_output(this) == ERR_OK) {
-    return true;
+err_t AsyncClientImpl::_send_locked() {
+  uint32_t now = millis();
+  _tx_last_packet = now;  // Save timestamp for `sent` callback
+  // Re-arm the timer only if it's not already active and there's something to send
+  if (!_ack_since && tcp_sndqueuelen(_pcb)) {
+    _ack_since = now - (now == 0);  // ensure is nonzero
   }
-  _tx_last_packet = backup;
-  return false;
+  return tcp_output(_pcb);
+}
+
+size_t AsyncClientImpl::add(const char *data, size_t size, uint8_t apiflags) {
+  if (size == 0 || data == NULL) {
+    return 0;
+  }
+  with_tcp_core_lock([&]() -> err_t {
+    if (!_pcb) {
+      size = 0;
+      return ERR_CONN;
+    };
+    size = _add_locked(data, size, apiflags);
+    return ERR_OK;
+  });
+  return size;
+}
+
+bool AsyncClientImpl::send() {
+  auto err = with_tcp_core_lock([&]() -> err_t {
+    if (!_pcb) {
+      return ERR_CONN;
+    };
+    return _send_locked();
+  });
+  return (err == ERR_OK);
+}
+
+size_t AsyncClientImpl::write(const char *data, size_t size, uint8_t apiflags) {
+  if (size == 0 || data == NULL) {
+    return 0;
+  }
+  size_t added = 0;
+  with_tcp_core_lock([&]() -> err_t {
+    if (_pcb) {
+      added = _add_locked(data, size, apiflags);
+      if (added) {
+        _send_locked();  // on failure lwIP keeps the data queued and retries
+      }
+    }
+    return ERR_OK;
+  });
+  return added;
 }
 
 size_t AsyncClientImpl::ack(size_t len) {
@@ -1474,7 +1502,7 @@ void AsyncClientImpl::_adopt(tcp_pcb *pcb) {
   _pcb = pcb;
   _rx_ack_len = 0;
   _tx_last_packet = 0;
-  _rx_last_ack = 0;
+  _ack_since = 0;
   _rx_last_packet = millis();
   _bind_tcp_callbacks(pcb, this);
 }
@@ -1485,7 +1513,6 @@ int8_t AsyncClientImpl::_connected(tcp_pcb *pcb, int8_t err) {
     async_tcp_log_d("%p != %p", (const void *)pcb, (const void *)_pcb);
     return ERR_OK;
   }
-  _rx_last_packet = millis();
   if (_connect_cb) {
     async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, _facade));
   }
@@ -1520,13 +1547,12 @@ int8_t AsyncClientImpl::_fin(tcp_pcb *pcb, int8_t err) {
   return ERR_OK;
 }
 
-int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint16_t len) {
+int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint16_t len, uint32_t time) {
   if (_pcb != pcb) {
     return ERR_CONN;
   }
-  _rx_last_ack = _rx_last_packet = millis();
   if (_sent_cb) {
-    async_tcp_log_elapsed("onAck", _sent_cb(_sent_cb_arg, _facade, len, (_rx_last_packet - _tx_last_packet)));
+    async_tcp_log_elapsed("onAck", _sent_cb(_sent_cb_arg, _facade, len, time));
   }
   return ERR_OK;
 }
@@ -1540,7 +1566,6 @@ int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       break;
     }
 
-    _rx_last_packet = millis();
     // we should not ack before we assimilate the data
     _ack_pcb = true;
     // Inline pbuf pop, similar to pbuf_dechain
@@ -1601,15 +1626,15 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
 
   // ACK Timeout
   if (_ack_timeout) {
-    const uint32_t one_day = 86400000;
-    bool last_tx_is_after_last_ack = (_rx_last_ack - _tx_last_packet + one_day) < one_day;
-    if (last_tx_is_after_last_ack && (now - _tx_last_packet) >= _ack_timeout) {
+    uint32_t since = _ack_since;  // Not quite interlocked with LwIP - safe enough
+    // If timeout is armed and timeout has expired
+    if (since && (now - since) >= _ack_timeout) {
       async_tcp_log_d("ack timeout %d", state());
       if (_timeout_cb) {
-        async_tcp_log_elapsed("onTimeout", _timeout_cb(_timeout_cb_arg, _facade, (now - _tx_last_packet)));
+        async_tcp_log_elapsed("onTimeout", _timeout_cb(_timeout_cb_arg, _facade, (now - since)));
         return ERR_OK;  // do not call poll callback
       }
-      // Otherwise fall through to poll - not sure why you'd configure a timeout without a callback
+      // Otherwise fall through to poll
     }
   }
 
@@ -1626,14 +1651,6 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
 
 bool AsyncClientImpl::free() {
   return this->freeable();  // these are synonymous
-}
-
-size_t AsyncClientImpl::write(const char *data, size_t size, uint8_t apiflags) {
-  size_t will_send = add(data, size, apiflags);
-  if (!will_send || !send()) {
-    return 0;
-  }
-  return will_send;
 }
 
 void AsyncClientImpl::setRxTimeout(uint32_t timeout) {
