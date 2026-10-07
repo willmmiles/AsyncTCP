@@ -1910,7 +1910,8 @@ const char *AsyncClient::errorToString(int8_t error) {
     case ERR_VAL:        return "Illegal value";
     case ERR_WOULDBLOCK: return "Operation would block";
     case ERR_USE:        return "Address in use";
-    case ERR_ALREADY:    return "Already connected";
+    case ERR_ALREADY:    return "Already connecting";
+    case ERR_ISCONN:     return "Already connected";
     case ERR_CONN:       return "Not connected";
     case ERR_IF:         return "Low-level netif error";
     case ERR_ABRT:       return "Connection aborted";
