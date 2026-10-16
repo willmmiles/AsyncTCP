@@ -299,6 +299,11 @@ public:
   AsyncServer(uint16_t port);
   ~AsyncServer();
 
+  // False if the server could not be allocated.  It then never listens.
+  bool valid() const {
+    return _impl != nullptr;
+  }
+
   // Noncopyable: the implementation holds one back-pointer, so a second facade sharing it
   // would leave one of them unreachable from it.
   AsyncServer(const AsyncServer &) = delete;
