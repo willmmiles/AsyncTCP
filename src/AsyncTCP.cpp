@@ -2262,7 +2262,7 @@ void AsyncClient::onPoll(AcConnectHandler cb, void *arg) {
   Async TCP Server
  */
 
-AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port) : _impl(std::make_shared<AsyncServerImpl>(this, addr, port)) {}
+AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port) : _impl(make_shared_nothrow<AsyncServerImpl>(this, addr, port)) {}
 
 #ifdef ARDUINO
 AsyncServer::AsyncServer(IPAddress addr, uint16_t port) {
@@ -2277,7 +2277,7 @@ AsyncServer::AsyncServer(IPAddress addr, uint16_t port) {
 #else
   addr.to_ip_addr_t(&a);
 #endif
-  _impl = std::make_shared<AsyncServerImpl>(this, a, port);
+  _impl = make_shared_nothrow<AsyncServerImpl>(this, a, port);
 }
 #if ESP_IDF_VERSION_MAJOR < 5 && __has_include(<IPv6Address.h>) && LWIP_IPV6
 AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) {
@@ -2286,7 +2286,7 @@ AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) {
 #if LWIP_IPV4 && LWIP_IPV6
   a.type = IPADDR_TYPE_V6;
 #endif
-  _impl = std::make_shared<AsyncServerImpl>(this, a, port);
+  _impl = make_shared_nothrow<AsyncServerImpl>(this, a, port);
 }
 #endif
 #endif
@@ -2299,10 +2299,13 @@ AsyncServer::AsyncServer(uint16_t port) {
 #else
   a.addr = INADDR_ANY;
 #endif
-  _impl = std::make_shared<AsyncServerImpl>(this, a, port);
+  _impl = make_shared_nothrow<AsyncServerImpl>(this, a, port);
 }
 
 AsyncServer::~AsyncServer() {
+  if (!_impl) {
+    return;
+  }
   _impl->end();
   // Detach: a connection accepted but not yet delivered still points at the implementation,
   // and this is how it learns there is no longer a server to hand it to.
@@ -2311,22 +2314,30 @@ AsyncServer::~AsyncServer() {
 }
 
 void AsyncServer::onClient(AcConnectHandler cb, void *arg) {
-  _impl->onClient(cb, arg);
+  if (_impl) {
+    _impl->onClient(cb, arg);
+  }
 }
 void AsyncServer::begin() {
-  _impl->begin();
+  if (_impl) {
+    _impl->begin();
+  }
 }
 void AsyncServer::end() {
-  _impl->end();
+  if (_impl) {
+    _impl->end();
+  }
 }
 void AsyncServer::setNoDelay(bool nodelay) {
-  _impl->setNoDelay(nodelay);
+  if (_impl) {
+    _impl->setNoDelay(nodelay);
+  }
 }
 bool AsyncServer::getNoDelay() const {
-  return _impl->getNoDelay();
+  return _impl && _impl->getNoDelay();
 }
 uint8_t AsyncServer::status() const {
-  return _impl->status();
+  return _impl ? _impl->status() : 0;
 }
 
 void AsyncServerImpl::begin() {
