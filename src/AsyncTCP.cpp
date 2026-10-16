@@ -1265,18 +1265,21 @@ AsyncClientImpl::~AsyncClientImpl() {
   ASYNCTCP_ASSERT(!_pcb);
 }
 
-AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(std::make_shared<AsyncClientImpl>(this)) {
+AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(make_shared_nothrow<AsyncClientImpl>(this)) {
   if (pcb) {
     // The pcb's callbacks queue events, so the task must be there to take them.
-    if (_start_async_task()) {
-      _impl->_adopt(pcb);
-    } else {
-      // The pcb is ours, and nothing could deliver its events.  Close rather than abort:
-      // in an accept callback, only the callback's return value can report ERR_ABRT.
+    if (!_impl) {
+      async_tcp_log_e("failed to allocate client");
+    } else if (!_start_async_task()) {
       async_tcp_log_e("failed to start task");
-      if (tcp_close(pcb) != ERR_OK) {
-        async_tcp_log_e("failed to close pcb");
-      }
+    } else {
+      _impl->_adopt(pcb);
+      return;
+    }
+    // The pcb is ours, and nothing could deliver its events.  Close rather than abort:
+    // in an accept callback, only the callback's return value can report ERR_ABRT.
+    if (tcp_close(pcb) != ERR_OK) {
+      async_tcp_log_e("failed to close pcb");
     }
   }
 }
@@ -1286,6 +1289,9 @@ AsyncClient::AsyncClient(std::shared_ptr<AsyncClientImpl> impl) : _impl(std::mov
 }
 
 AsyncClient::~AsyncClient() {
+  if (!_impl) {
+    return;
+  }
   // Unconditional, because whether there is anything to close is not knowable from here -
   // _pcb and the lookup token are both written by the LwIP thread, and a name lookup can
   // still turn into a bound pcb after we have looked.
@@ -2019,35 +2025,40 @@ const char *AsyncClientImpl::stateToString() const {
 /*
  * AsyncClient - the application-facing facade.
  *
- * Every method below forwards to the reference-counted implementation.  _impl is never
- * null for a live AsyncClient: it is created in the constructor and only released in
- * the destructor.
+ * Every method below forwards to the reference-counted implementation.  _impl is null only
+ * if it could not be allocated.  Such a client can never connect, so only the methods used
+ * before connecting, and to clean up, check for it.
  */
 
 bool AsyncClient::connect(ip_addr_t addr, uint16_t port) {
-  return _impl->connect(addr, port);
+  return _impl && _impl->connect(addr, port);
 }
 
 bool AsyncClient::connect(const char *host, uint16_t port) {
-  return _impl->connect(host, port);
+  return _impl && _impl->connect(host, port);
 }
 
 #ifdef ARDUINO
 bool AsyncClient::connect(const IPAddress &ip, uint16_t port) {
-  return _impl->connect(ip, port);
+  return _impl && _impl->connect(ip, port);
 }
 #if LWIP_IPV6 && ESP_IDF_VERSION_MAJOR < 5
 bool AsyncClient::connect(const IPv6Address &ip, uint16_t port) {
-  return _impl->connect(ip, port);
+  return _impl && _impl->connect(ip, port);
 }
 #endif
 #endif
 
 void AsyncClient::close() {
-  _impl->close();
+  if (_impl) {
+    _impl->close();
+  }
 }
 
 int8_t AsyncClient::abort() {
+  if (!_impl) {
+    return ERR_CONN;
+  }
   return _impl->abort();
 }
 
@@ -2219,43 +2230,59 @@ tcp_pcb *AsyncClient::pcb() {
 }
 
 void AsyncClient::onConnect(AcConnectHandler cb, void *arg) {
-  _impl->_connect_cb = cb;
-  _impl->_connect_cb_arg = arg;
+  if (_impl) {
+    _impl->_connect_cb = cb;
+    _impl->_connect_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onDisconnect(AcConnectHandler cb, void *arg) {
-  _impl->_discard_cb = cb;
-  _impl->_discard_cb_arg = arg;
+  if (_impl) {
+    _impl->_discard_cb = cb;
+    _impl->_discard_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onAck(AcAckHandler cb, void *arg) {
-  _impl->_sent_cb = cb;
-  _impl->_sent_cb_arg = arg;
+  if (_impl) {
+    _impl->_sent_cb = cb;
+    _impl->_sent_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onError(AcErrorHandler cb, void *arg) {
-  _impl->_error_cb = cb;
-  _impl->_error_cb_arg = arg;
+  if (_impl) {
+    _impl->_error_cb = cb;
+    _impl->_error_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onData(AcDataHandler cb, void *arg) {
-  _impl->_recv_cb = cb;
-  _impl->_recv_cb_arg = arg;
+  if (_impl) {
+    _impl->_recv_cb = cb;
+    _impl->_recv_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onPacket(AcPacketHandler cb, void *arg) {
-  _impl->_pb_cb = cb;
-  _impl->_pb_cb_arg = arg;
+  if (_impl) {
+    _impl->_pb_cb = cb;
+    _impl->_pb_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onTimeout(AcTimeoutHandler cb, void *arg) {
-  _impl->_timeout_cb = cb;
-  _impl->_timeout_cb_arg = arg;
+  if (_impl) {
+    _impl->_timeout_cb = cb;
+    _impl->_timeout_cb_arg = arg;
+  }
 }
 
 void AsyncClient::onPoll(AcConnectHandler cb, void *arg) {
-  _impl->_poll_cb = cb;
-  _impl->_poll_cb_arg = arg;
+  if (_impl) {
+    _impl->_poll_cb = cb;
+    _impl->_poll_cb_arg = arg;
+  }
 }
 
 /*

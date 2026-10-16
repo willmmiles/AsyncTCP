@@ -81,6 +81,13 @@ public:
   AsyncClient(tcp_pcb *pcb = 0);
   ~AsyncClient();
 
+  // False if the client could not be allocated.  It then never connects; connect() returns
+  // false, and the callback setters, close(), abort() and the destructor are safe but have
+  // unspecified effect.  Every other method requires a valid client.
+  bool valid() const {
+    return _impl != nullptr;
+  }
+
   // Noncopyable
   AsyncClient(const AsyncClient &) = delete;
   AsyncClient &operator=(const AsyncClient &) = delete;
