@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <memory>
+#include <new>
 #include <type_traits>
 
 /**
@@ -285,6 +287,80 @@ public:
     return holds_mutex;
   };
 };
+
+/**
+ * make_shared_nothrow - nonthrowing shared_ptr construction
+ *
+ * std::make_shared cannot report allocation failure without exceptions.  Instead, allocate
+ * the storage up front and hand it to std::allocate_shared, so the library still builds its
+ * own control block and object together, and failure is reported before anything is built.
+ *
+ * The storage is sized from libstdc++'s control block type, so it is exact; allocate()
+ * checks that this is the type the library actually requests.  The allocator stored in the
+ * block is empty, so the block is the same size as make_shared's.  The copy that allocates
+ * is built from a reference to the caller's request, which is how it finds the storage.
+ */
+template<typename T> struct prealloc_tag;
+template<typename U, typename T> struct prealloc_alloc;
+template<typename U, typename T> using prealloc_rebind = typename std::conditional<std::is_same<U, T>::value, prealloc_tag<T>, prealloc_alloc<U, T>>::type;
+#if defined(__GLIBCXX__)
+template<typename T> using prealloc_block = std::_Sp_counted_ptr_inplace<T, prealloc_tag<T>, __gnu_cxx::__default_lock_policy>;
+#else
+#error "This C++ stdlib is not supported yet; please define prealloc_block as the in-place control block type"
+#endif
+
+// Deallocation tag - stored in control block, 0 bytes size
+template<typename T> struct prealloc_tag {
+  using value_type = T;
+  // Rebinding to any other type promotes to a prealloc_alloc.
+  // This allows us to store 0 bytes in the control block, but supply the actual storage to allocate_shared
+  template<typename U> struct rebind {
+    using other = prealloc_rebind<U, T>;
+  };
+  T *allocate(size_t);  // never called
+  void deallocate(T *p, size_t) {
+    delete[] reinterpret_cast<char *>(p);
+  }
+};
+
+// Subclass of the above that stores the buffer.  Allows us to upcast to the 0-byte type.
+template<typename T> struct prealloc_request : prealloc_tag<T> {
+  char *buf;
+};
+
+// Actual allocation implementation, constructed via prealloc_rebind around a prealloc_tag
+// Essentially promotes the prealloc_request to a full allocator for the control block; origin
+// is assumed to be a reference to an underlying prealloc_request that was previously allocated
+// by make_shared_nothrow.
+// During deallocation, we can simply delete the buffer as we are directly passed the pointer.
+template<typename U, typename T> struct prealloc_alloc {
+  using value_type = U;
+  template<typename V> struct rebind {
+    using other = prealloc_rebind<V, T>;
+  };
+  const prealloc_tag<T> *origin;  // only a prealloc_request when allocating
+  prealloc_alloc(const prealloc_tag<T> &tag) : origin(&tag) {}
+  U *allocate(size_t) {
+    static_assert(std::is_same<U, prealloc_block<T>>::value, "storage was sized for a different control block");
+    return reinterpret_cast<U *>(static_cast<const prealloc_request<T> *>(origin)->buf);
+  }
+  void deallocate(U *p, size_t) {
+    delete[] reinterpret_cast<char *>(p);
+  }
+};
+
+// make_shared_nothrow
+// Nonthrowing version of make_shared: returns an empty shared_ptr if the allocation fails.
+// Like `make_shared`, uses a single, correctly-sized allocation for control block and object in one transaction.
+template<typename T, typename... Args> std::shared_ptr<T> make_shared_nothrow(Args &&...args) {
+  static_assert(alignof(prealloc_block<T>) <= alignof(std::max_align_t), "overaligned control block");
+  prealloc_request<T> request;
+  request.buf = new (std::nothrow) char[sizeof(prealloc_block<T>)];
+  if (!request.buf) {
+    return nullptr;
+  }
+  return std::allocate_shared<T>(static_cast<const prealloc_tag<T> &>(request), std::forward<Args>(args)...);
+}
 }  // anonymous namespace
 
 static SimpleIntrusiveList<lwip_tcp_event_packet_t> _async_queue;
@@ -2372,7 +2448,13 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
   // The facade will be constructed by the async task when it processes this event -- if the connection
   // errors out prior to accept running, the event will be discarded and the implementation destroyed
   // as there's no API to inform the server of the error.
-  e->impl = std::make_shared<AsyncClientImpl>(nullptr);
+  e->impl = make_shared_nothrow<AsyncClientImpl>(nullptr);
+  if (!e->impl) {
+    async_tcp_log_e("_accept failed: couldn't allocate client");
+    delete e;
+    tcp_abort(pcb);
+    return ERR_ABRT;
+  }
   e->impl->_adopt(pcb);
   e->server = server->shared_from_this();  // Lock server impl in scope
   e->accept.epoch = server->_epoch;        // And remember in case it's end()ed
