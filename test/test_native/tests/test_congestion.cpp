@@ -152,6 +152,37 @@ static void test_congestion_several_connections_each_lose_nothing_but_polls(void
   TEST_ASSERT_EQUAL_size_t(0, live_pbufs());
 }
 
+static void test_congestion_backlogged_connections_take_turns(void) {
+  // All of one connection's backlog arrives before any of the other's; neither may be
+  // served to the end before the other is served at all.
+  std::string log;
+  AsyncClient a;
+  AsyncClient b;
+  a.onData([&](void *, AsyncClient *, void *, size_t) {
+    log += 'a';
+  });
+  b.onData([&](void *, AsyncClient *, void *, size_t) {
+    log += 'b';
+  });
+  tcp_pcb *pa = establish(a);
+  tcp_pcb *pb = establish(b);
+
+  for (int i = 0; i < kRounds; i++) {
+    fire_recv(pa, "a", 1);
+  }
+  for (int i = 0; i < kRounds; i++) {
+    fire_recv(pb, "b", 1);
+  }
+  asynctcp_test_pump();
+
+  TEST_ASSERT_EQUAL_size_t(2 * kRounds, log.size());
+  TEST_ASSERT_TRUE(log.find('b') < log.rfind('a'));
+  TEST_ASSERT_TRUE(log.find('a') < log.rfind('b'));
+
+  a.close();
+  b.close();
+}
+
 static void test_congestion_terminal_events_queued_in_a_flood_arrive_once(void) {
   // Every connection's end is queued behind the flood before the task runs at all.
   const int kClients = 4;
@@ -288,6 +319,7 @@ void run_congestion_tests(void) {
   UnitySetTestFile(__FILE__);
   RUN_TEST(test_congestion_one_connection_loses_nothing_but_polls);
   RUN_TEST(test_congestion_several_connections_each_lose_nothing_but_polls);
+  RUN_TEST(test_congestion_backlogged_connections_take_turns);
   RUN_TEST(test_congestion_terminal_events_queued_in_a_flood_arrive_once);
   RUN_TEST(test_congestion_accepts_and_their_data_all_arrive);
   RUN_TEST(test_congestion_idle_connection_is_polled_once_the_queue_drains);
