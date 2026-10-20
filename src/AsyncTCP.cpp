@@ -1330,23 +1330,21 @@ static err_t _tcp_dns_start_api(struct tcpip_api_call_data *api_call_msg) {
   // Supersedes any lookup already outstanding; that one will find itself disowned.
   if (client->_dns_token) {
     client->_dns_token->client = nullptr;
-    // The displaced lookup will never report, so its obligation dies with it rather than
-    // passing to this attempt - which may answer from cache and never arm one of its own,
-    // and would then refuse itself on a notice nobody can ever deliver.
-    client->_dispose_owed = false;
   }
   client->_connect_port = msg->dns.port;
   client->_dns_token = msg->dns.token;
 
+  // Reporting success promises onConnect or onError, and a dispose with it, even though no
+  // pcb exists yet (and may never).  Armed before asking, as LwIP can answer before it
+  // returns, and an error reported before this was armed would consume a notification that
+  // was not yet owed - and then rearm it forever.
+  client->_dispose_owed = true;
   msg->err = dns_gethostbyname(msg->dns.host, msg->dns.addr, (dns_found_callback)&AsyncTCP_detail::tcp_dns_found, msg->dns.token);
-  if (msg->err == ERR_INPROGRESS) {
-    // Reporting success promises onConnect or onError, and a dispose with it, even though no
-    // pcb exists yet (and may never).  Armed here rather than on return: the answer can land
-    // the instant this transaction ends, and an error reported before the caller had armed it
-    // would consume a notification that was not yet owed - and then rearm it forever.
-    client->_dispose_owed = true;
-  } else {
-    client->_dns_token = nullptr;  // no callback is coming
+  if (msg->err != ERR_INPROGRESS) {
+    // No callback is coming.  Any displaced lookup's obligation dies with it, rather than
+    // passing to this attempt, which the caller concludes itself.
+    client->_dispose_owed = false;
+    client->_dns_token = nullptr;
   }
   return msg->err;
 }
