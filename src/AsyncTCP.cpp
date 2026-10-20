@@ -454,6 +454,15 @@ template<typename T> struct ready_fifo {
 static TaskHandle_t _async_service_task_handle = NULL;
 
 /*
+  A name lookup in flight.  LwIP owns it until it answers; until then the client points at
+  it, and it back at the client.  Abandoning or superseding the lookup, in LwIP context,
+  clears both, so the answer never reaches a client that may since have been destroyed.
+*/
+struct dns_lookup {
+  AsyncClientImpl *client;
+};
+
+/*
   Client implementation, held by shared_ptr.
 
   The AsyncClient facade is created and destroyed by the application, but LwIP and the
@@ -466,8 +475,8 @@ static TaskHandle_t _async_service_task_handle = NULL;
   being called, ensuring that any captures remain alive until the callback completes,
   even if the AsyncClient object is destroyed.
 
-  The context passed to LwIP callbacks are deliberately not owners -- instead this class
-  owns them and ensures that all are released before destruction.
+  The contexts passed to LwIP are deliberately not owners, and each is cleared before
+  destruction.
 
   _facade is nulled when the application's object is destroyed.  Callback dispatch is
   always gated on it, so a detached implementation runs no user code.
@@ -485,8 +494,8 @@ public:
   */
   tcp_pcb *_pcb;
   uint16_t _connect_port;
-  std::weak_ptr<AsyncClientImpl> *_dns_token;  // non-owning pointer to the most recent DNS lookup token
-  bool _dispose_owed;                          // a terminal notification is owed to the application
+  dns_lookup *_dns_token;  // the lookup in flight, if any
+  bool _dispose_owed;      // a terminal notification is owed to the application
 
   /*
     Members held under the queue mutex: what LwIP has reported that the async task has yet
@@ -1004,7 +1013,8 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
 
 //  Stand down any outstanding name lookup.  Run in LwIP context to ensure atomicity with the tcp_dns_found() callback.
 static void _abandon_resolve(AsyncClientImpl *client) {
-  if (client) {
+  if (client && client->_dns_token) {
+    client->_dns_token->client = nullptr;
     client->_dns_token = nullptr;
   }
 }
@@ -1095,16 +1105,10 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
   // ets_printf("+DNS: name=%s ipaddr=0x%08x arg=%x\n", name, ipaddr, arg);
   // 'name' points into LwIP's DNS table, which the next lookup recycles; don't keep it.
   (void)name;
-  // Adopt ownership of the callback state from the argument passed by LwIP.
-  std::unique_ptr<std::weak_ptr<AsyncClientImpl>> callback_state(reinterpret_cast<std::weak_ptr<AsyncClientImpl> *>(arg));
-  // Validate that our client still exists.
-  auto client = callback_state->lock();
+  // Adopt ownership of the lookup from the argument passed by LwIP.
+  std::unique_ptr<dns_lookup> lookup(reinterpret_cast<dns_lookup *>(arg));
+  AsyncClientImpl *client = lookup->client;
   if (!client) {
-    return;  // the implementation was destroyed while the lookup was in flight
-  }
-
-  // Validate that we're the most recent DNS lookup for this client.
-  if (client->_dns_token != callback_state.get()) {
     return;  // close(), abort() or a newer lookup superseded this query
   }
   const uint16_t port = client->_connect_port;
@@ -1119,7 +1123,7 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
   const bool resolved = (ipaddr != nullptr) && !ip_addr_isany_val(*ipaddr);
 
   // Start the connection right away; we're already in LwIP context
-  if (resolved && _tcp_connect_in_context(client.get(), ipaddr, port) == ERR_OK) {
+  if (resolved && _tcp_connect_in_context(client, ipaddr, port) == ERR_OK) {
     return;
   }
 
@@ -1128,7 +1132,7 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
   pbuf_ring rx;
   {
     queue_mutex_guard guard;
-    rx = _fail_locked(client.get(), resolved ? ERR_CONN : -55);
+    rx = _fail_locked(client, resolved ? ERR_CONN : -55);
   }
   rx.free();
 }
@@ -1155,7 +1159,7 @@ typedef struct {
     struct {
       const char *host;
       ip_addr_t *addr;
-      std::weak_ptr<AsyncClientImpl> *token;
+      dns_lookup *token;
       uint16_t port;
     } dns;
   };
@@ -1323,8 +1327,9 @@ static err_t _tcp_dns_start_api(struct tcpip_api_call_data *api_call_msg) {
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   AsyncClientImpl *client = msg->client;
 
-  // Supersedes any lookup already outstanding; that one will find the token moved on.
+  // Supersedes any lookup already outstanding; that one will find itself disowned.
   if (client->_dns_token) {
+    client->_dns_token->client = nullptr;
     // The displaced lookup will never report, so its obligation dies with it rather than
     // passing to this attempt - which may answer from cache and never arm one of its own,
     // and would then refuse itself on a notice nobody can ever deliver.
@@ -1346,7 +1351,7 @@ static err_t _tcp_dns_start_api(struct tcpip_api_call_data *api_call_msg) {
   return msg->err;
 }
 
-static err_t _tcp_dns_start(AsyncClientImpl *client, const char *host, ip_addr_t *addr, uint16_t port, std::weak_ptr<AsyncClientImpl> *token) {
+static err_t _tcp_dns_start(AsyncClientImpl *client, const char *host, ip_addr_t *addr, uint16_t port, dns_lookup *token) {
   tcp_api_call_t msg;
   msg.client = client;
   msg.dns.host = host;
@@ -1370,7 +1375,6 @@ AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
 
 AsyncClientImpl::~AsyncClientImpl() {
   // Every path that drops the last reference must ensure the binding was cleared first.
-  // This can be called from the LwIP thread, so any cleanup must have been performed already.
   ASYNCTCP_ASSERT(!_pcb);
   ASYNCTCP_ASSERT(!ready_fifo<AsyncClientImpl>::listed(this));
 }
@@ -1538,9 +1542,9 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
   // it's not really wedged, LwIP guarantees a return, but the timeouts might be longer
   // than a client might expect.
   // To avoid this leak, we allocate a unique "lookup context" for each request, and
-  // validate it when the request completes.  Ownership of the context lives in the
+  // disown it if the request is superseded.  Ownership of the context lives in the
   // LwIP DNS callback once triggered.
-  std::unique_ptr<std::weak_ptr<AsyncClientImpl>> callback_state(new (std::nothrow) std::weak_ptr<AsyncClientImpl>(shared_from_this()));
+  std::unique_ptr<dns_lookup> callback_state(new (std::nothrow) dns_lookup{this});
   if (!callback_state) {
     async_tcp_log_e("Failed to allocate the lookup context");
     return false;
