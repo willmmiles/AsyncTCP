@@ -196,7 +196,6 @@ typedef enum {
 // One thing the async task takes from a client to deliver.  It lives on the task's stack.
 struct lwip_tcp_event_packet_t {
   lwip_tcp_event_t event;
-  tcp_pcb *pcb;
   union {
     struct {
       int8_t err;
@@ -606,12 +605,12 @@ public:
   ASYNCTCP_ALWAYS_INLINE const char *stateToString() const;
 
   void _adopt(tcp_pcb *pcb);
-  int8_t _connected(tcp_pcb *pcb, int8_t err);
+  void _connected();
   void _error(int8_t err);
-  int8_t _poll(tcp_pcb *pcb);
-  int8_t _sent(tcp_pcb *pcb, uint32_t len, uint32_t time);
-  int8_t _fin(tcp_pcb *pcb, int8_t err);
-  int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
+  void _poll();
+  void _sent(uint32_t len, uint32_t time);
+  void _fin();
+  void _recv(pbuf *pb);
 
   // Add and send internal implementations; must be called in LwIP context
   // These are called out to share code with write(), but allow the whole
@@ -695,9 +694,18 @@ static bool _ready_idle() {
   return !_ready_clients.head && !_ready_servers.head;
 }
 
-// The client whose callback the async task is running, if any.  Guarded by the queue mutex.
+// The client whose callback the async task is running, if any, and whether that connection
+// has since been closed or failed - so a callback that closes and reconnects cannot have
+// the rest of what was taken for the old connection delivered to the new one.  Written under
+// the queue mutex; the async task reads _servicing_ended unlocked, which is exact for a close
+// made from its own callbacks.
 static AsyncClientImpl *_servicing = nullptr;
+static bool _servicing_ended = false;
 static AsyncServerImpl *_servicing_server = nullptr;  // likewise, the server whose onClient is running
+
+static bool _service_ended(const AsyncClientImpl *client) {
+  return _servicing_ended && _servicing == client;
+}
 
 static bool _is_owed(const AsyncClientImpl *client) {
   return client->_pending_err || client->_pending || client->_acked || !client->_rx.empty();
@@ -717,6 +725,7 @@ static void _ready_client(AsyncClientImpl *client) {
 // Must hold the queue mutex.  Forget everything a client is owed, returning its data for
 // the caller to free once the mutex is released.
 static pbuf_ring _discard_locked(AsyncClientImpl *client) {
+  _servicing_ended |= client == _servicing;
   client->_pending_err = 0;
   client->_pending = 0;
   client->_acked = 0;
@@ -806,7 +815,6 @@ bool __attribute__((noinline)) AsyncTCP_detail::service_accept() {
 */
 static ASYNCTCP_ALWAYS_INLINE lwip_tcp_event_packet_t _take_event(AsyncClientImpl *client) {
   lwip_tcp_event_packet_t e;
-  e.pcb = client->_pcb;
   if (client->_pending_err) {
     e.event = LWIP_TCP_ERROR;
     e.error.err = client->_pending_err;
@@ -846,11 +854,11 @@ static ASYNCTCP_ALWAYS_INLINE void handle_async_event(AsyncClientImpl *client, l
   }
   switch (e.event) {
     case LWIP_TCP_ERROR:     client->_error(e.error.err); break;
-    case LWIP_TCP_CONNECTED: client->_connected(e.pcb, ERR_OK); break;
-    case LWIP_TCP_SENT:      client->_sent(e.pcb, e.sent.len, e.sent.time); break;
-    case LWIP_TCP_RECV:      client->_recv(e.pcb, e.recv.pb, ERR_OK); break;
-    case LWIP_TCP_FIN:       client->_fin(e.pcb, ERR_OK); break;
-    case LWIP_TCP_POLL:      client->_poll(e.pcb); break;
+    case LWIP_TCP_CONNECTED: client->_connected(); break;
+    case LWIP_TCP_SENT:      client->_sent(e.sent.len, e.sent.time); break;
+    case LWIP_TCP_RECV:      client->_recv(e.recv.pb); break;
+    case LWIP_TCP_FIN:       client->_fin(); break;
+    case LWIP_TCP_POLL:      client->_poll(); break;
     case LWIP_TCP_NONE:      break;
   }
 }
@@ -876,6 +884,7 @@ bool AsyncTCP_detail::service() {
     }
     if (!accept && (client = _ready_clients.pop_front())) {
       _servicing = client;
+      _servicing_ended = false;
       e = _take_event(client);
       if (_is_owed(client)) {
         _ready_clients.push_back(client);
@@ -1697,16 +1706,10 @@ void AsyncClientImpl::_adopt(tcp_pcb *pcb) {
   _bind_tcp_callbacks(pcb, this);
 }
 
-int8_t AsyncClientImpl::_connected(tcp_pcb *pcb, int8_t err) {
-  if (pcb != _pcb) {
-    // Stale event for a pcb we no longer own
-    async_tcp_log_d("%p != %p", (const void *)pcb, (const void *)_pcb);
-    return ERR_OK;
-  }
+void AsyncClientImpl::_connected() {
   if (_connect_cb) {
     async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, _facade));
   }
-  return ERR_OK;
 }
 
 void AsyncClientImpl::_error(int8_t err) {
@@ -1729,30 +1732,21 @@ void AsyncClientImpl::_error(int8_t err) {
   }
 }
 
-int8_t AsyncClientImpl::_fin(tcp_pcb *pcb, int8_t err) {
-  if (_pcb != pcb) {
-    return ERR_CONN;
-  }
+void AsyncClientImpl::_fin() {
   close();
-  return ERR_OK;
 }
 
-int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint32_t len, uint32_t time) {
-  if (_pcb != pcb) {
-    return ERR_CONN;
-  }
+void AsyncClientImpl::_sent(uint32_t len, uint32_t time) {
   if (_sent_cb) {
     async_tcp_log_elapsed("onAck", _sent_cb(_sent_cb_arg, _facade, len, time));
   }
-  return ERR_OK;
 }
 
-int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
+void AsyncClientImpl::_recv(pbuf *pb) {
   while (pb != NULL) {
-    // Ensure the object is still valid and the pcb we're processing for is still the one held.
     // The callback (or other user code) could close the connection, destroy the client, or
     // replace the connection outright while we're in the loop.
-    if (_pcb != pcb || !_facade) {
+    if (_service_ended(this) || !_facade) {
       break;
     }
 
@@ -1773,8 +1767,8 @@ int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, _facade, b->payload, b->len));
       }
       pbuf_free(b);
-      if (_pcb != pcb) {
-        // Bizarre as it might sound, it's actually possible for the user callback to reconnect.
+      if (_service_ended(this)) {
+        // Closed, and perhaps even reconnected: what was held is not the new connection's to ack.
         _in_callback_ack_len = 0;
         break;
       }
@@ -1791,18 +1785,11 @@ int8_t AsyncClientImpl::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
   if (pb) {
     pbuf_free(pb);  // release whatever we did not get to
   }
-  return ERR_OK;
 }
 
-int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
-  if (!_pcb) {
-    // async_tcp_log_d("pcb is NULL");
-    return ERR_OK;
-  }
-
-  if (pcb != _pcb) {
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)(uintptr_t)pcb, (uint32_t)(uintptr_t)_pcb);
-    return ERR_OK;
+void AsyncClientImpl::_poll() {
+  if (_service_ended(this)) {
+    return;
   }
 
   uint32_t now = millis();
@@ -1811,7 +1798,7 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
   if (_rx_timeout && (now - _rx_last_packet) >= (_rx_timeout * 1000)) {
     async_tcp_log_d("rx timeout %d", state());
     close();
-    return ERR_OK;  // connection is now closed; don't call poll callback
+    return;  // connection is now closed; don't call poll callback
   }
 
   // ACK Timeout
@@ -1822,7 +1809,7 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
       async_tcp_log_d("ack timeout %d", state());
       if (_timeout_cb) {
         async_tcp_log_elapsed("onTimeout", _timeout_cb(_timeout_cb_arg, _facade, (now - since)));
-        return ERR_OK;  // do not call poll callback
+        return;  // do not call poll callback
       }
       // Otherwise fall through to poll
     }
@@ -1832,7 +1819,6 @@ int8_t AsyncClientImpl::_poll(tcp_pcb *pcb) {
   if (_poll_cb) {
     async_tcp_log_elapsed("onPoll", _poll_cb(_poll_cb_arg, _facade));
   }
-  return ERR_OK;
 }
 
 /*
@@ -2330,7 +2316,12 @@ const char *AsyncClient::stateToString() const {
 }
 
 int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
-  return _impl->_recv(pcb, pb, err);
+  if (pcb == _impl->_pcb) {
+    _impl->_recv(pb);
+  } else if (pb) {
+    pbuf_free(pb);
+  }
+  return ERR_OK;
 }
 
 tcp_pcb *AsyncClient::pcb() {
