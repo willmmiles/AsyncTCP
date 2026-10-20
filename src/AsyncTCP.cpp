@@ -493,7 +493,7 @@ public:
     to deliver.  A pending error replaces everything else.
   */
   int8_t _pending_err;  // nonzero: the connection has ended with this error
-  uint8_t _pending;     // pending_* flags
+  uint8_t _pending;     // pending_* flags, and refuse_connect
   pbuf_ring _rx;
   uint32_t _acked;  // bytes acked
   uint32_t _acked_time;
@@ -684,6 +684,9 @@ enum : uint8_t {
   pending_connected = 1 << 0,
   pending_fin = 1 << 1,
   pending_poll = 1 << 2,
+  pending_events = pending_connected | pending_fin | pending_poll,
+  // Not an event: the facade is being destroyed, so it may not connect again.
+  refuse_connect = 1 << 7,
 };
 
 static ready_fifo<AsyncClientImpl> _ready_clients;
@@ -708,7 +711,7 @@ static bool _service_ended(const AsyncClientImpl *client) {
 }
 
 static bool _is_owed(const AsyncClientImpl *client) {
-  return client->_pending_err || client->_pending || client->_acked || !client->_rx.empty();
+  return client->_pending_err || (client->_pending & pending_events) || client->_acked || !client->_rx.empty();
 }
 
 // List a client that is owed something, unless it already is, or has no facade yet.
@@ -727,7 +730,7 @@ static void _ready_client(AsyncClientImpl *client) {
 static pbuf_ring _discard_locked(AsyncClientImpl *client) {
   _servicing_ended |= client == _servicing;
   client->_pending_err = 0;
-  client->_pending = 0;
+  client->_pending &= ~pending_events;
   client->_acked = 0;
   return client->_rx.take();
 }
@@ -1404,6 +1407,12 @@ AsyncClient::~AsyncClient() {
   if (!_impl) {
     return;
   }
+  // onDisconnect, run by the close below, may not connect again: with no facade, nothing
+  // could report that connection, and it would outlive the implementation it points at.
+  {
+    queue_mutex_guard guard(queue_mutex_guard::if_created);
+    _impl->_pending |= refuse_connect;
+  }
   // Unconditional, because whether there is anything to close is not knowable from here -
   // _pcb and the lookup token are both written by the LwIP thread, and a name lookup can
   // still turn into a bound pcb after we have looked.
@@ -1435,6 +1444,10 @@ bool AsyncClient::operator==(const AsyncClient &other) const {
  * */
 
 bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
+  if (_pending & refuse_connect) {
+    async_tcp_log_d("client is being destroyed");
+    return false;
+  }
   if (_pcb) {
     async_tcp_log_d("already connected, state %d", _pcb->state);
     return false;
@@ -1495,6 +1508,10 @@ bool AsyncClientImpl::connect(const IPv6Address &ip, uint16_t port) {
 bool AsyncClientImpl::connect(const char *host, uint16_t port) {
   ip_addr_t addr;
 
+  if (_pending & refuse_connect) {
+    async_tcp_log_d("client is being destroyed");
+    return false;
+  }
   if (_pcb) {
     async_tcp_log_d("already connected, state %d", _pcb->state);
     return false;
