@@ -248,14 +248,14 @@ class queue_mutex_guard {
 
 public:
   // For paths that can only run once _start_async_task() has succeeded.
-  inline queue_mutex_guard() : holds_mutex(xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
+  ASYNCTCP_ALWAYS_INLINE queue_mutex_guard() : holds_mutex(xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)) {};
   // For paths that can run before it ever has: takes nothing if the mutex was never created,
   // in which case nothing can have been listed and no task is reading.
   enum if_created_t {
     if_created
   };
-  inline explicit queue_mutex_guard(if_created_t) : holds_mutex(_async_queue_mutex && xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
-  inline ~queue_mutex_guard() {
+  ASYNCTCP_ALWAYS_INLINE explicit queue_mutex_guard(if_created_t) : holds_mutex(_async_queue_mutex && xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
+  ASYNCTCP_ALWAYS_INLINE ~queue_mutex_guard() {
     if (holds_mutex) {
       xSemaphoreGive(_async_queue_mutex);
     }
