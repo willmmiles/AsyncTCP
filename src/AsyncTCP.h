@@ -51,10 +51,6 @@ extern "C" {
 #define CONFIG_ASYNC_TCP_PRIORITY 10
 #endif
 
-#ifndef CONFIG_ASYNC_TCP_QUEUE_SIZE
-#define CONFIG_ASYNC_TCP_QUEUE_SIZE 64
-#endif
-
 #ifndef CONFIG_ASYNC_TCP_MAX_ACK_TIME
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME 5000
 #endif
@@ -287,10 +283,10 @@ protected:
   // because destroying a facade closes it and closing is a transaction.
   explicit AsyncClient(std::shared_ptr<AsyncClientImpl> impl);
 
-  // Every scrap of state lives in the implementation object, which outlives this
-  // facade: queued events share ownership of it.  That keeps the callbacks themselves
-  // alive for the duration of a call, so destroying an AsyncClient from inside one of
-  // its own callbacks is safe.
+  // Every scrap of state lives in the implementation object, which can outlive this
+  // facade: the async task takes over this reference if it still has the implementation.
+  // That keeps the callbacks themselves alive for the duration of a call, so destroying an
+  // AsyncClient from inside one of its own callbacks is safe.
   std::shared_ptr<AsyncClientImpl> _impl;
 };
 
