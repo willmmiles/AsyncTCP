@@ -3,7 +3,6 @@
 
 #include "AsyncTCP.h"
 #include "AsyncTCPLogging.h"
-#include "AsyncTCPSimpleIntrusiveList.h"
 
 #include <algorithm>
 #include <cassert>
@@ -185,6 +184,7 @@ template<typename T> err_t with_tcp_core_lock(T &&func) {
  * */
 
 typedef enum {
+  LWIP_TCP_NONE,
   LWIP_TCP_SENT,
   LWIP_TCP_RECV,
   LWIP_TCP_FIN,
@@ -193,45 +193,29 @@ typedef enum {
   LWIP_TCP_CONNECTED
 } lwip_tcp_event_t;
 
+// One thing the async task takes from a client to deliver.  It lives on the task's stack.
 struct lwip_tcp_event_packet_t {
-  lwip_tcp_event_packet_t *next;
   lwip_tcp_event_t event;
-  std::shared_ptr<AsyncClientImpl> impl;  // keeps it alive for the life of the event
+  tcp_pcb *pcb;
   union {
-    struct {
-      tcp_pcb *pcb;
-      int8_t err;
-    } connected;
     struct {
       int8_t err;
     } error;
     struct {
-      tcp_pcb *pcb;
-      uint16_t len;
+      uint32_t len;
       uint32_t time;
     } sent;
     struct {
-      tcp_pcb *pcb;
       pbuf *pb;
-      int8_t err;
     } recv;
-    struct {
-      tcp_pcb *pcb;
-      int8_t err;
-    } fin;
-    struct {
-      tcp_pcb *pcb;
-    } poll;
   };
-
-  inline lwip_tcp_event_packet_t(lwip_tcp_event_t _event, std::shared_ptr<AsyncClientImpl> _impl) : next(nullptr), event(_event), impl(std::move(_impl)){};
 };
 
 // Detail class for interacting with AsyncClient internals, but without exposing the API
 class AsyncTCP_detail {
 public:
   // Helper functions
-  static void __attribute__((visibility("internal"))) handle_async_event(lwip_tcp_event_packet_t *event);
+  static bool __attribute__((visibility("internal"))) service();
   static bool __attribute__((visibility("internal"))) service_accept();
 
   // LwIP TCP event callbacks that (will) require privileged access
@@ -244,10 +228,10 @@ public:
 };
 
 namespace {
-// Global queue mutex
+// Global queue mutex: guards the ready lists and what each client is owed
 static SemaphoreHandle_t _async_queue_mutex = nullptr;
 
-// Created by _start_async_task(), which every path that can queue an event passes first.
+// Created by _start_async_task(), which every path that can list a client passes first.
 // Unsynchronized, as _start_async_task() always has been.
 static bool _init_queue_mutex() {
   if (!_async_queue_mutex) {
@@ -259,7 +243,7 @@ static bool _init_queue_mutex() {
   return _async_queue_mutex != nullptr;
 }
 
-// Guard class for the global queue
+// Guard class for the global queue mutex
 class queue_mutex_guard {
   bool holds_mutex;
 
@@ -267,7 +251,7 @@ public:
   // For paths that can only run once _start_async_task() has succeeded.
   inline queue_mutex_guard() : holds_mutex(xSemaphoreTake(_async_queue_mutex, portMAX_DELAY)){};
   // For paths that can run before it ever has: takes nothing if the mutex was never created,
-  // in which case nothing can have been queued and no task is reading.
+  // in which case nothing can have been listed and no task is reading.
   enum if_created_t {
     if_created
   };
@@ -356,6 +340,77 @@ template<typename T, typename... Args> std::shared_ptr<T> make_shared_nothrow(Ar
   return std::allocate_shared<T>(static_cast<const prealloc_tag<T> &>(request), std::forward<Args>(args)...);
 }
 
+/*
+  Received chains waiting to be delivered, each as LwIP delivered it.
+
+  The chains are threaded into a ring through the pbufs' own links and held by the ring's
+  last pbuf, so any number of them costs one pointer.  tot_len is left alone: each chain keeps
+  LwIP's end marker - its last pbuf has tot_len == len - which is how pop() finds where the
+  oldest one ends.
+*/
+class pbuf_ring {
+public:
+  pbuf_ring() : _last(nullptr) {}
+
+  bool empty() const {
+    return !_last;
+  }
+
+  // A chain's last pbuf; separate from push() so the walk can be made before taking a lock.
+  static pbuf *end_of(pbuf *chain) {
+    while (chain->next) {
+      chain = chain->next;
+    }
+    return chain;
+  }
+
+  // Append a chain, given its last pbuf.
+  void push(pbuf *chain, pbuf *end) {
+    end->next = _last ? _last->next : chain;
+    if (_last) {
+      _last->next = chain;
+    }
+    _last = end;
+  }
+
+  // Remove the oldest chain, null-terminated; nullptr if there is none.
+  pbuf *pop() {
+    if (!_last) {
+      return nullptr;
+    }
+    pbuf *head = _last->next;
+    pbuf *end = head;
+    while (end != _last && end->tot_len != end->len) {
+      end = end->next;
+    }
+    if (end == _last) {
+      _last = nullptr;
+    } else {
+      _last->next = end->next;
+    }
+    end->next = nullptr;
+    return head;
+  }
+
+  // Remove everything, so it can be freed outside a lock.
+  pbuf_ring take() {
+    pbuf_ring taken;
+    taken._last = _last;
+    _last = nullptr;
+    return taken;
+  }
+
+  // Chain by chain: pbuf_free() stops at a pbuf someone else still holds.
+  void free() {
+    while (pbuf *pb = pop()) {
+      pbuf_free(pb);
+    }
+  }
+
+private:
+  pbuf *_last;
+};
+
 // A FIFO linked through T::_ready_next, which points back at its own object while that is
 // on no list.  It does not own what it holds.  Moving empties the source.
 template<typename T> struct ready_fifo {
@@ -397,16 +452,16 @@ template<typename T> struct ready_fifo {
 };
 }  // anonymous namespace
 
-static SimpleIntrusiveList<lwip_tcp_event_packet_t> _async_queue;
 static TaskHandle_t _async_service_task_handle = NULL;
 
 /*
   Client implementation, held by shared_ptr.
 
   The AsyncClient facade is created and destroyed by the application, but LwIP and the
-  event queue both hold pointers that outlive it.  Putting the state here and sharing
-  ownership of it means neither has to care: the facade and each queued event own the
-  implementation, and it lives until the last of them lets go.
+  ready list both hold pointers that outlive it.  Putting the state here and sharing
+  ownership of it means neither has to care: the facade and the ready list (or, until it
+  is delivered, its server's accept list) own the implementation, and it lives until the
+  last of them lets go.
 
   Because the callbacks live here rather than on the facade, they stay in scope while
   being called, ensuring that any captures remain alive until the callback completes,
@@ -416,8 +471,7 @@ static TaskHandle_t _async_service_task_handle = NULL;
   owns them and ensures that all are released before destruction.
 
   _facade is nulled when the application's object is destroyed.  Callback dispatch is
-  always gated on it, so a detached implementation runs no user code and any leftover
-  events simply drain.
+  always gated on it, so a detached implementation runs no user code.
 */
 class AsyncClientImpl : public std::enable_shared_from_this<AsyncClientImpl> {
 public:
@@ -436,11 +490,24 @@ public:
   bool _dispose_owed;                          // a terminal notification is owed to the application
 
   /*
-    Held under the queue mutex.  An accepted connection waits on its server's list, holding
-    itself, until the async task gives it a facade.
+    Members held under the queue mutex: what LwIP has reported that the async task has yet
+    to deliver.  A pending error replaces everything else.
   */
+  int8_t _pending_err;  // nonzero: the connection has ended with this error
+  uint8_t _pending;     // pending_* flags
+  pbuf_ring _rx;
+  uint32_t _acked;  // bytes acked
+  uint32_t _acked_time;
+  // The facade owns us; this holds us instead while we wait to be delivered to one, or once it
+  // is destroyed while the async task still has us listed or in hand.
   std::shared_ptr<AsyncClientImpl> _ready_self;
   AsyncClientImpl *_ready_next;
+
+  /*
+    Written under the queue mutex, as LwIP's callbacks read it there to decide whether to
+    list the client; nulled once the application's object is destroyed.
+  */
+  AsyncClient *_facade;
 
   /*
     Not synchronized.  The handlers are installed by the application before it connects
@@ -448,7 +515,6 @@ public:
     async task owns in practice, touched from the calling task only through calls the
     application is expected not to make from two tasks at once against one client.
   */
-  AsyncClient *_facade;  // nulled once the application's object is destroyed
 
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
@@ -543,7 +609,7 @@ public:
   int8_t _connected(tcp_pcb *pcb, int8_t err);
   void _error(int8_t err);
   int8_t _poll(tcp_pcb *pcb);
-  int8_t _sent(tcp_pcb *pcb, uint16_t len, uint32_t time);
+  int8_t _sent(tcp_pcb *pcb, uint32_t len, uint32_t time);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
   int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
 
@@ -604,123 +670,86 @@ public:
   int8_t _accepted(AsyncClient *client);
 };
 
-static uint32_t _xor_shift_state = 31;  // any nonzero seed will do
-static uint32_t _xor_shift_next() {
-  uint32_t x = _xor_shift_state;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  return _xor_shift_state = x;
+/*
+  Ready list
+
+  What LwIP reports for a client is recorded on the client itself, and the client goes on
+  this list - once, however much it is owed.  The async task takes the client at the front
+  and delivers one thing; if more is owed, the client goes to the back.  Recording an event
+  never allocates, so nothing LwIP reports can be lost for want of memory.
+
+  A client that has not yet been handed to the application (it has no facade) is not
+  listed; what it is owed waits until it is.  Guarded by the queue mutex.
+*/
+enum : uint8_t {
+  pending_connected = 1 << 0,
+  pending_fin = 1 << 1,
+  pending_poll = 1 << 2,
+};
+
+static ready_fifo<AsyncClientImpl> _ready_clients;
+static ready_fifo<AsyncServerImpl> _ready_servers;  // servers with accepted connections waiting
+
+// The task sleeps only once it has found both lists empty, so only then does it need waking.
+static bool _ready_idle() {
+  return !_ready_clients.head && !_ready_servers.head;
 }
 
-static void _free_event(lwip_tcp_event_packet_t *evpkt) {
-  if ((evpkt->event == LWIP_TCP_RECV) && (evpkt->recv.pb != nullptr)) {
-    pbuf_free(evpkt->recv.pb);
-  }
-  delete evpkt;  // releases the event's reference to the implementation
+// The client whose callback the async task is running, if any.  Guarded by the queue mutex.
+static AsyncClientImpl *_servicing = nullptr;
+static AsyncServerImpl *_servicing_server = nullptr;  // likewise, the server whose onClient is running
+
+static bool _is_owed(const AsyncClientImpl *client) {
+  return client->_pending_err || client->_pending || client->_acked || !client->_rx.empty();
 }
 
-static inline void _send_async_event(lwip_tcp_event_packet_t *e) {
-  ASYNCTCP_ASSERT(e != nullptr);
-  ASYNCTCP_ASSERT(e->impl != nullptr);
-  _async_queue.push_back(e);
-  xTaskNotifyGive(_async_service_task_handle);
-}
-
-static inline lwip_tcp_event_packet_t *_get_async_event() {
-  lwip_tcp_event_packet_t *result = nullptr;
-  // Discarded events are disposed of once the mutex is released, to keep pbuf_free() and
-  // close() out of the critical section.
-  lwip_tcp_event_packet_t *discarded = nullptr;
-
-  {
-    queue_mutex_guard guard;
-    while (1) {
-      lwip_tcp_event_packet_t *e = _async_queue.pop_front();
-
-      if ((!e) || (e->event != LWIP_TCP_POLL)) {
-        result = e;
-        break;
-      }
-
-      /*
-      Let's try to coalesce two (or more) consecutive poll events into one
-      this usually happens with poor implemented user-callbacks that are runs too long and makes poll events to stack in the queue
-      if consecutive user callback for a same connection runs longer that poll time then it will fill the queue with events until it deadlocks.
-      This is a workaround to mitigate such poor designs and won't let other events/connections to starve the task time.
-      It won't be effective if user would run multiple simultaneous long running callbacks due to message interleaving.
-      todo: implement some kind of fair dequeuing or (better) simply punish user for a bad designed callbacks by resetting hog connections
-    */
-      for (lwip_tcp_event_packet_t *next_pkt = _async_queue.begin(); next_pkt && (next_pkt->impl == e->impl) && (next_pkt->event == LWIP_TCP_POLL);
-           next_pkt = _async_queue.begin()) {
-        // if the next event that will come is a poll event for the same connection, we can discard it and continue
-        auto dup = _async_queue.pop_front();
-        dup->next = discarded;
-        discarded = dup;
-        async_tcp_log_d("coalescing polls, network congestion or async callbacks might be too slow!");
-      }
-
-      /*
-      now we have to decide if to proceed with poll callback handler or discard it?
-      poor designed apps using asynctcp without proper dataflow control could flood the queue with interleaved pool/ack events.
-      I.e. on each poll app would try to generate more data to send, which in turn results in additional ack event triggering chain effect
-      for long connections. Or poll callback could take long time starving other connections. Anyway our goal is to keep the queue length
-      grows under control (if possible) and poll events are the safest to discard.
-      Let's discard poll events processing using linear-increasing probability curve when queue size grows over 3/4
-      Poll events are periodic and connection could get another chance next time
-    */
-      if (_async_queue.size() > (_xor_shift_next() % CONFIG_ASYNC_TCP_QUEUE_SIZE / 4 + CONFIG_ASYNC_TCP_QUEUE_SIZE * 3 / 4)) {
-        e->next = discarded;
-        discarded = e;
-        async_tcp_log_d("discarding poll due to queue congestion");
-        continue;
-      }
-
-      result = e;
-      break;
+// List a client that is owed something, unless it already is, or has no facade yet.
+static void _ready_client(AsyncClientImpl *client) {
+  if (!ready_fifo<AsyncClientImpl>::listed(client) && client->_facade) {
+    const bool idle = _ready_idle();
+    _ready_clients.push_back(client);
+    if (idle) {
+      xTaskNotifyGive(_async_service_task_handle);
     }
   }
-
-  while (discarded) {
-    auto t = discarded;
-    discarded = t->next;
-    _free_event(t);
-  }
-  return result;
 }
 
-static size_t _remove_events_for_client(AsyncClientImpl *client, lwip_tcp_event_packet_t *terminal_event = nullptr) {
-  lwip_tcp_event_packet_t *removed_event_chain;
+// Must hold the queue mutex.  Forget everything a client is owed, returning its data for
+// the caller to free once the mutex is released.
+static pbuf_ring _discard_locked(AsyncClientImpl *client) {
+  client->_pending_err = 0;
+  client->_pending = 0;
+  client->_acked = 0;
+  return client->_rx.take();
+}
+
+// Must hold the queue mutex.  End the connection with err, which replaces anything else
+// still owed, including a connect not yet reported.
+static pbuf_ring _fail_locked(AsyncClientImpl *client, int8_t err) {
+  ASYNCTCP_ASSERT(err != ERR_OK);
+  pbuf_ring rx = _discard_locked(client);
+  client->_pending_err = err;
+  _ready_client(client);
+  return rx;
+}
+
+// Forget everything a client is owed.  Must be called in LwIP context, so nothing new can
+// arrive behind it.  Returns whether an error was pending.
+static bool _clear_pending(AsyncClientImpl *client) {
+  pbuf_ring rx;
+  bool had_error;
   {
     queue_mutex_guard guard(queue_mutex_guard::if_created);
     if (!guard) {
-      // Never started, so nothing can have been queued.  A terminal event comes from an
-      // LwIP callback, and a bound pcb implies a started task.
-      ASYNCTCP_ASSERT(!terminal_event);
-      return 0;
+      // Never started, so nothing can have been recorded.
+      return false;
     }
-    removed_event_chain = _async_queue.remove_if([=](lwip_tcp_event_packet_t &pkt) {
-      return pkt.impl.get() == client;
-    });
-    if (terminal_event) {
-      _send_async_event(terminal_event);
-    }
+    had_error = client->_pending_err != 0;
+    rx = _discard_locked(client);
   }
-
-  size_t count = 0;
-  while (removed_event_chain) {
-    ++count;
-    auto t = removed_event_chain;
-    removed_event_chain = t->next;
-    _free_event(t);
-  }
-  return count;
-};
-
-// Servers with accepted connections waiting, and the one whose onClient the async task is
-// running, if any.  Guarded by the queue mutex.
-static ready_fifo<AsyncServerImpl> _ready_servers;
-static AsyncServerImpl *_servicing_server = nullptr;
+  rx.free();
+  return had_error;
+}
 
 // Release an implementation whose facade was destroyed while the async task had it.  Out
 // of line: it is rare.
@@ -736,36 +765,31 @@ template<typename T> static ASYNCTCP_ALWAYS_INLINE T *_finish(T *&servicing) {
   return (impl && impl->_ready_self && !ready_fifo<T>::listed(impl)) ? impl : nullptr;
 }
 
-// Deliver one accepted connection, if a server has one waiting.  Returns false if none does.
-bool AsyncTCP_detail::service_accept() {
+// Deliver one accepted connection.  Out of line: accepts are rare.
+bool __attribute__((noinline)) AsyncTCP_detail::service_accept() {
   AsyncServerImpl *server;
   AsyncServerImpl *orphan;
   std::shared_ptr<AsyncClientImpl> client;  // released after the mutex
-  bool failed = false;
+  int8_t err = 0;
   {
     queue_mutex_guard guard;
     orphan = _finish(_servicing_server);
     server = _ready_servers.pop_front();
+    ASYNCTCP_ASSERT(server);  // only this task takes servers off the list
     _servicing_server = server;
-    if (server) {
-      if (AsyncClientImpl *accepted = server->_accepts.pop_front()) {
-        client = std::move(accepted->_ready_self);
-        failed = !client->_pcb;
-      }
-      if (server->_accepts.head) {
-        _ready_servers.push_back(server);
-      }
+    if (AsyncClientImpl *accepted = server->_accepts.pop_front()) {
+      client = std::move(accepted->_ready_self);
+      err = accepted->_pending_err;
+    }
+    if (server->_accepts.head) {
+      _ready_servers.push_back(server);
     }
   }
   if (orphan) {
     _release(orphan);
   }
-  if (!server) {
-    return false;
-  }
-  // One that failed before it could be delivered is dropped as though it never arrived; its
-  // error event drains, as it has no facade.
-  if (client && !failed) {
+  // One that failed before it could be delivered is dropped as though it never arrived.
+  if (client && !err) {
     AsyncClient *c = new (std::nothrow) AsyncClient(client);
     if (c) {
       server->_accepted(c);
@@ -776,34 +800,102 @@ bool AsyncTCP_detail::service_accept() {
   return true;
 }
 
-void AsyncTCP_detail::handle_async_event(lwip_tcp_event_packet_t *e) {
-  ASYNCTCP_ASSERT(e->impl);
-
-  if ((e->impl->_facade == NULL)) {
-    // A detached implementation has no facade to hand to the user's callbacks, so its
-    // events simply drain.  The reference the event holds keeps it alive until then.
-    // ets_printf("event arg == NULL: 0x%08x\n", e->recv.pcb);
-  } else if (e->event == LWIP_TCP_RECV) {
-    // ets_printf("-R: 0x%08x\n", e->recv.pcb);
-    e->impl->_recv(e->recv.pcb, e->recv.pb, e->recv.err);
-    e->recv.pb = nullptr;  // given to client
-  } else if (e->event == LWIP_TCP_FIN) {
-    // ets_printf("-F: 0x%08x\n", e->fin.pcb);
-    e->impl->_fin(e->fin.pcb, e->fin.err);
-  } else if (e->event == LWIP_TCP_SENT) {
-    // ets_printf("-S: 0x%08x\n", e->sent.pcb);
-    e->impl->_sent(e->sent.pcb, e->sent.len, e->sent.time);
-  } else if (e->event == LWIP_TCP_POLL) {
-    // ets_printf("-P: 0x%08x\n", e->poll.pcb);
-    e->impl->_poll(e->poll.pcb);
-  } else if (e->event == LWIP_TCP_ERROR) {
-    // ets_printf("-E: 0x%08x %d\n", e->impl, e->error.err);
-    e->impl->_error(e->error.err);
-  } else if (e->event == LWIP_TCP_CONNECTED) {
-    // ets_printf("C: 0x%08x 0x%08x %d\n", e->impl, e->connected.pcb, e->connected.err);
-    e->impl->_connected(e->connected.pcb, e->connected.err);
+/*
+  Must hold the queue mutex.  Take the one thing next owed to a client: connected, ack, data,
+  FIN, then poll.  A pending error is taken alone, as it discarded the rest when it arrived.
+*/
+static ASYNCTCP_ALWAYS_INLINE lwip_tcp_event_packet_t _take_event(AsyncClientImpl *client) {
+  lwip_tcp_event_packet_t e;
+  e.pcb = client->_pcb;
+  if (client->_pending_err) {
+    e.event = LWIP_TCP_ERROR;
+    e.error.err = client->_pending_err;
+    client->_pending_err = 0;
+  } else if (client->_pending & pending_connected) {
+    e.event = LWIP_TCP_CONNECTED;
+    client->_pending &= ~pending_connected;
+  } else if (client->_acked) {
+    e.event = LWIP_TCP_SENT;
+    e.sent.len = client->_acked;
+    e.sent.time = client->_acked_time;
+    client->_acked = 0;
+  } else if (!client->_rx.empty()) {
+    e.event = LWIP_TCP_RECV;
+    e.recv.pb = client->_rx.pop();
+  } else if (client->_pending & pending_fin) {
+    e.event = LWIP_TCP_FIN;
+    client->_pending &= ~pending_fin;
+  } else if (client->_pending & pending_poll) {
+    e.event = LWIP_TCP_POLL;
+    client->_pending &= ~pending_poll;
+  } else {
+    e.event = LWIP_TCP_NONE;  // closed since it was listed
   }
-  _free_event(e);
+  return e;
+}
+
+static ASYNCTCP_ALWAYS_INLINE void handle_async_event(AsyncClientImpl *client, lwip_tcp_event_packet_t &e) {
+  if (!client->_facade) {
+    // Detached since it was taken: closing discarded the rest, but not what we took.  The
+    // check is unlocked, so a facade destroyed on another task can still slip past it into
+    // a callback, as the facade pointer handed to callbacks always could.
+    if (e.event == LWIP_TCP_RECV) {
+      pbuf_free(e.recv.pb);
+    }
+    return;
+  }
+  switch (e.event) {
+    case LWIP_TCP_ERROR:     client->_error(e.error.err); break;
+    case LWIP_TCP_CONNECTED: client->_connected(e.pcb, ERR_OK); break;
+    case LWIP_TCP_SENT:      client->_sent(e.pcb, e.sent.len, e.sent.time); break;
+    case LWIP_TCP_RECV:      client->_recv(e.pcb, e.recv.pb, ERR_OK); break;
+    case LWIP_TCP_FIN:       client->_fin(e.pcb, ERR_OK); break;
+    case LWIP_TCP_POLL:      client->_poll(e.pcb); break;
+    case LWIP_TCP_NONE:      break;
+  }
+}
+
+/*
+  Deliver one thing.  Accepted connections come first, so the application learns of a
+  connection promptly; what it is owed waits regardless, as it is not listed until it has a
+  facade.  Otherwise, deliver one thing owed to the client at the front of the ready list.
+  Returns false if there was nothing to do.
+*/
+bool AsyncTCP_detail::service() {
+  AsyncClientImpl *client = nullptr;
+  AsyncClientImpl *orphan;
+  AsyncServerImpl *orphan_server = nullptr;
+  bool accept;
+  lwip_tcp_event_packet_t e;
+  {
+    queue_mutex_guard guard;
+    orphan = _finish(_servicing);
+    accept = _ready_servers.head;
+    if (!accept && _servicing_server) {
+      orphan_server = _finish(_servicing_server);
+    }
+    if (!accept && (client = _ready_clients.pop_front())) {
+      _servicing = client;
+      e = _take_event(client);
+      if (_is_owed(client)) {
+        _ready_clients.push_back(client);
+      }
+    }
+  }
+  if (orphan) {
+    _release(orphan);
+  }
+  if (orphan_server) {
+    _release(orphan_server);
+  }
+  if (accept) {
+    return service_accept();
+  }
+  if (!client) {
+    return false;
+  }
+  handle_async_event(client, e);
+  return true;
 }
 
 static void _async_service_task(void *pvParameters) {
@@ -814,23 +906,12 @@ static void _async_service_task(void *pvParameters) {
   }
 #endif
   for (;;) {
-    // Accepts first, so that a connection reaches the application before anything it is owed.
-    for (;;) {
-      if (!AsyncTCP_detail::service_accept()) {
-        auto packet = _get_async_event();
-        if (!packet) {
-          break;
-        }
-        async_tcp_log_elapsed("handle_async_event", AsyncTCP_detail::handle_async_event(packet));
-      }
+    while (AsyncTCP_detail::service()) {
 #if CONFIG_ASYNC_TCP_USE_WDT
       esp_task_wdt_reset();
 #endif
     }
-    // queue is empty
-    // DEBUG_PRINTF("Async task waiting 0x%08",(intptr_t)_async_queue_head);
     ulTaskNotifyTake(pdTRUE, ASYNC_TCP_MAX_TASK_SLEEP);
-    // DEBUG_PRINTF("Async task woke = %d 0x%08x",q, (intptr_t)_async_queue_head);
 #if CONFIG_ASYNC_TCP_USE_WDT
     esp_task_wdt_reset();
 #endif
@@ -905,7 +986,7 @@ static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClientImpl *client) {
   tcp_err(pcb, NULL);
   tcp_poll(pcb, NULL, 0);
   if (client) {
-    _remove_events_for_client(client);
+    _clear_pending(client);
   }
 }
 
@@ -920,16 +1001,10 @@ static void _abandon_resolve(AsyncClientImpl *client) {
 static int8_t _tcp_connected(void *arg, tcp_pcb *pcb, int8_t err) {
   // ets_printf("+C: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_CONNECTED, client->shared_from_this()};
-  if (!e) {
-    async_tcp_log_e("Failed to allocate event packet");
-    return ERR_MEM;
-  }
-  e->connected.pcb = pcb;
-  e->connected.err = err;
   client->_rx_last_packet = millis();
   queue_mutex_guard guard;
-  _send_async_event(e);
+  client->_pending |= pending_connected;
+  _ready_client(client);
   return ERR_OK;
 }
 
@@ -939,67 +1014,34 @@ int8_t AsyncTCP_detail::tcp_poll(void *arg, struct tcp_pcb *pcb) {
     return ERR_OK;
   }
 
-  // throttle polling events queueing when event queue is getting filled up, let it handle _onack's
-  {
-    queue_mutex_guard guard;
-    // async_tcp_log_d("qs:%u", _async_queue.size());
-    if (_async_queue.size() > (_xor_shift_next() % CONFIG_ASYNC_TCP_QUEUE_SIZE / 2 + CONFIG_ASYNC_TCP_QUEUE_SIZE / 4)) {
-      async_tcp_log_d("throttling");
-      return ERR_OK;
-    }
-  }
-
   // ets_printf("+P: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_POLL, client->shared_from_this()};
-  if (!e) {
-    async_tcp_log_e("Failed to allocate event packet");
-    return ERR_MEM;
-  }
-  e->poll.pcb = pcb;
-
   queue_mutex_guard guard;
-  _send_async_event(e);
+  client->_pending |= pending_poll;
+  _ready_client(client);
   return ERR_OK;
 }
 
 int8_t AsyncTCP_detail::tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_RECV, client->shared_from_this()};
-  if (!e) {
-    async_tcp_log_e("Failed to allocate event packet");
-    return ERR_MEM;
-  }
   client->_rx_last_packet = millis();
+  pbuf *end = pb ? pbuf_ring::end_of(pb) : nullptr;
+  queue_mutex_guard guard;
   if (pb) {
     // ets_printf("+R: 0x%08x\n", pcb);
-    e->recv.pcb = pcb;
-    e->recv.pb = pb;
-    e->recv.err = err;
+    client->_rx.push(pb, end);
   } else {
     // ets_printf("+F: 0x%08x\n", pcb);
-    e->event = LWIP_TCP_FIN;
-    e->fin.pcb = pcb;
-    e->fin.err = err;
+    client->_pending |= pending_fin;
   }
-
-  queue_mutex_guard guard;
-  _send_async_event(e);
+  _ready_client(client);
   return ERR_OK;
 }
 
 int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   // ets_printf("+S: 0x%08x\n", pcb);
   AsyncClientImpl *client = reinterpret_cast<AsyncClientImpl *>(arg);
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_SENT, client->shared_from_this()};
-  if (!e) {
-    async_tcp_log_e("Failed to allocate event packet");
-    return ERR_MEM;
-  }
-  e->sent.pcb = pcb;
-  e->sent.len = len;
   uint32_t now = millis();
-  e->sent.time = now - client->_tx_last_packet;
   // Update timeout tracking
   if (client->_ack_since) {
     // Re-arm the timer if we've still got outstanding data; otherwise cancel it
@@ -1008,7 +1050,10 @@ int8_t AsyncTCP_detail::tcp_sent(void *arg, struct tcp_pcb *pcb, uint16_t len) {
   client->_rx_last_packet = now;
 
   queue_mutex_guard guard;
-  _send_async_event(e);
+  // Acks not yet delivered are merged; the time is the latest one's.
+  client->_acked += len;
+  client->_acked_time = now - client->_tx_last_packet;
+  _ready_client(client);
   return ERR_OK;
 }
 
@@ -1026,17 +1071,12 @@ void AsyncTCP_detail::tcp_error(void *arg, int8_t err) {
   // saved value in the client object to avoid future use.
   client->_pcb = nullptr;
 
-  // Construct event packet first.  This will hold the client in scope in case we have yet to
-  // process its ACCEPT event (ie. it has no facade yet, and so the ACCEPT event is the only reference).
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ERROR, client->shared_from_this()};
-  if (e) {
-    e->error.err = err;
-  } else {
-    async_tcp_log_e("Failed to allocate event packet");
+  pbuf_ring rx;
+  {
+    queue_mutex_guard guard;
+    rx = _fail_locked(client, err);
   }
-
-  // Remove all pending events for this client, and send the terminal error event if we could allocate it.
-  _remove_events_for_client(client, e);
+  rx.free();
 }
 
 void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, void *arg) {
@@ -1072,15 +1112,13 @@ void AsyncTCP_detail::tcp_dns_found(const char *name, const ip_addr_t *ipaddr, v
   }
 
   // The original DNS-based connect() reported "success" to the caller, so we must notify
-  // them of the failure.  Queue an error event packet.
-  lwip_tcp_event_packet_t *e = new (std::nothrow) lwip_tcp_event_packet_t{LWIP_TCP_ERROR, client};
-  if (!e) {
-    async_tcp_log_e("Failed to allocate event packet");
-    return;
+  // them of the failure.
+  pbuf_ring rx;
+  {
+    queue_mutex_guard guard;
+    rx = _fail_locked(client.get(), resolved ? ERR_CONN : -55);
   }
-  e->error.err = resolved ? ERR_CONN : -55;
-  queue_mutex_guard guard;
-  _send_async_event(e);
+  rx.free();
 }
 
 /*
@@ -1136,9 +1174,9 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
   // Unlike the other calls, this is not a direct wrapper of the LwIP function; we perform
   // the AsyncClient teardown interlocked safely with the LwIP task.
 
-  // As a postcondition, the queue must not have any events referencing this client.  This
-  // is because it is possible for an error event to have been queued, clearing the pcb*,
-  // but after the async thread has committed to closing/destructing the AsyncClient.
+  // As a postcondition, nothing is pending for this client.  This is because an error
+  // can have arrived, clearing the pcb*, after the async thread has committed to
+  // closing/destructing the AsyncClient.
 
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   AsyncClientImpl *client = msg->client;
@@ -1160,8 +1198,8 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
     msg->err = ERR_OK;
     client->_pcb = nullptr;  // PCB is now the property of LwIP
   } else {
-    // Ensure there is not an error event queued for this client
-    if (_remove_events_for_client(client)) {
+    // Ensure there is not an error pending for this client
+    if (_clear_pending(client)) {
       msg->err = ERR_OK;  // dispose needs to be run
     }
   }
@@ -1177,12 +1215,11 @@ static esp_err_t _tcp_close(AsyncClientImpl *client, size_t ack) {
 }
 
 static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
-  // Like close(), we must ensure that the queue is cleared of any events referencing the
-  // AsyncClient.
+  // Like close(), we must ensure that nothing is left pending for the AsyncClient.
   // ERR_ABRT: the pcb was aborted.
-  // ERR_OK:   the pcb was already gone, but a queued error event was purged, so the
+  // ERR_OK:   the pcb was already gone, but a pending error was discarded, so the
   //           caller must still run the discard callback (dispose needs to run).
-  // ERR_CONN: nothing to do (pcb already null and no queued events).
+  // ERR_CONN: nothing to do (pcb already null and no pending error).
   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
   AsyncClientImpl *client = msg->client;
   _abandon_resolve(client);
@@ -1192,7 +1229,7 @@ static err_t _tcp_abort_api(struct tcpip_api_call_data *api_call_msg) {
     client->_pcb = nullptr;  // PCB is now the property of LwIP
     msg->err = ERR_ABRT;
   } else {
-    msg->err = _remove_events_for_client(client) ? ERR_OK : ERR_CONN;
+    msg->err = _clear_pending(client) ? ERR_OK : ERR_CONN;
   }
   return msg->err;
 }
@@ -1313,10 +1350,11 @@ static err_t _tcp_dns_start(AsyncClientImpl *client, const char *host, ip_addr_t
  */
 
 AsyncClientImpl::AsyncClientImpl(AsyncClient *facade)
-  : _pcb(nullptr), _connect_port(0), _dns_token(nullptr), _dispose_owed(false), _ready_next(this), _facade(facade), _connect_cb(0), _connect_cb_arg(0),
-    _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0),
-    _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0),
-    _ack_since(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _in_callback_ack_len(0) {}
+  : _pcb(nullptr), _connect_port(0), _dns_token(nullptr), _dispose_owed(false), _pending_err(0), _pending(0), _acked(0), _acked_time(0), _ready_next(this),
+    _facade(facade), _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0),
+    _recv_cb(0), _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true),
+    _tx_last_packet(0), _rx_ack_len(0), _rx_last_packet(0), _rx_timeout(0), _ack_since(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME),
+    _in_callback_ack_len(0) {}
 
 AsyncClientImpl::~AsyncClientImpl() {
   // Every path that drops the last reference must ensure the binding was cleared first.
@@ -1327,7 +1365,7 @@ AsyncClientImpl::~AsyncClientImpl() {
 
 AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(make_shared_nothrow<AsyncClientImpl>(this)) {
   if (pcb) {
-    // The pcb's callbacks queue events, so the task must be there to take them.
+    // The pcb's callbacks list the client, so the task must be there to service it.
     if (!_impl) {
       async_tcp_log_e("failed to allocate client");
     } else if (!_start_async_task()) {
@@ -1345,7 +1383,12 @@ AsyncClient::AsyncClient(tcp_pcb *pcb) : _impl(make_shared_nothrow<AsyncClientIm
 }
 
 AsyncClient::AsyncClient(std::shared_ptr<AsyncClientImpl> impl) : _impl(std::move(impl)) {
+  // Under the queue mutex, so LwIP either holds what it reports until now, or lists it.
+  queue_mutex_guard guard;
   _impl->_facade = this;
+  if (_is_owed(_impl.get())) {
+    _ready_client(_impl.get());
+  }
 }
 
 AsyncClient::~AsyncClient() {
@@ -1356,9 +1399,14 @@ AsyncClient::~AsyncClient() {
   // _pcb and the lookup token are both written by the LwIP thread, and a name lookup can
   // still turn into a bound pcb after we have looked.
   _impl->close();
-  // Detach: queued events and LwIP callbacks may still reach the implementation, but
-  // must not run user code against a facade that no longer exists.
+  // Detach: the async task may still reach the implementation, but must not run user code
+  // against a facade that no longer exists.  If it has the implementation listed or in hand,
+  // it takes over our reference and releases it once done.
+  queue_mutex_guard guard(queue_mutex_guard::if_created);
   _impl->_facade = nullptr;
+  if (ready_fifo<AsyncClientImpl>::listed(_impl.get()) || _servicing == _impl.get()) {
+    _impl->_ready_self = std::move(_impl);
+  }
 }
 
 /*
@@ -1387,8 +1435,8 @@ bool AsyncClientImpl::connect(ip_addr_t addr, uint16_t port) {
     return false;
   }
   if (_dispose_owed) {
-    // A previous failed connection has not reported yet - the error event
-    // is still queued (otherwise we'd have _pcb).  Treat this as "not ready
+    // A previous failed connection has not reported yet - the error is
+    // still pending (otherwise we'd have _pcb).  Treat this as "not ready
     // for a new connection".
     async_tcp_log_d("previous connection not yet reported");
     return false;
@@ -1445,7 +1493,7 @@ bool AsyncClientImpl::connect(const char *host, uint16_t port) {
   // For compatibility, calling `connect()` with a lookup outstanding supersedes
   // the previous lookup.
   if (_dispose_owed && !_dns_token) {
-    // The previous connection has errored out but its async event hasn't run.
+    // The previous connection has errored out but its error hasn't been delivered.
     // We can't cancel it -- it may already be pending on the async task.
     // So we treat this as "not ready for a new connection".
     async_tcp_log_d("previous connection not yet reported");
@@ -1514,7 +1562,7 @@ void AsyncClientImpl::close() {
   _rx_ack_len = 0;
   _in_callback_ack_len = 0;
   _tcp_close(this, pending);
-  // _pcb is now NULL, all queued events are cleared, and any outstanding lookup has been
+  // _pcb is now NULL, nothing is pending, and any outstanding lookup has been
   // stood down.  Call the dispose callback if owed.
   if (_facade && _dispose_owed) {
     _dispose_owed = false;
@@ -1530,7 +1578,7 @@ int8_t AsyncClientImpl::abort() {
   // _pcb is now NULL
   // LwIP invokes the error callback when abort is issued; preserve this semantic.
   // This will also trigger the dispose callback if otherwise owed (ie. error is already pending or canceling a DNS lookup).
-  // If the pcb was previously invalidated by some other queued error, we've discarded that value; so we always send ERR_ABRT.
+  // If the pcb was previously invalidated by some other pending error, we've discarded that value; so we always send ERR_ABRT.
   if (err != ERR_CONN || _dispose_owed) {
     _error(ERR_ABRT);
   }
@@ -1689,7 +1737,7 @@ int8_t AsyncClientImpl::_fin(tcp_pcb *pcb, int8_t err) {
   return ERR_OK;
 }
 
-int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint16_t len, uint32_t time) {
+int8_t AsyncClientImpl::_sent(tcp_pcb *pcb, uint32_t len, uint32_t time) {
   if (_pcb != pcb) {
     return ERR_CONN;
   }
@@ -2566,8 +2614,11 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
   c->_ready_self = std::move(client);
   server->_accepts.push_back(c);
   if (!ready_fifo<AsyncServerImpl>::listed(server)) {
+    const bool idle = _ready_idle();
     _ready_servers.push_back(server);
-    xTaskNotifyGive(_async_service_task_handle);
+    if (idle) {
+      xTaskNotifyGive(_async_service_task_handle);
+    }
   }
   return ERR_OK;
 }
