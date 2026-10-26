@@ -204,6 +204,7 @@ public:
   // no ACK timeout for the send() call in milliseconds
   void setAckTimeout(uint32_t timeout);
 
+  // applies to the open connection only; not kept across connect()
   void setNoDelay(bool nodelay) const;
   bool getNoDelay();
 
