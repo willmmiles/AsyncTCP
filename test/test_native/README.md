@@ -39,14 +39,15 @@ pio test -e native -a -x=congestion    # all but those
 
 ## Reading the results
 
-A failing test is a defect in the library, not in the test, and stays red until the
-library is fixed: no test is skipped or expected to fail. So a run need not be green.
-What counts is the difference: a change must not make a test fail that passes without it.
+A failing test is a defect in the library, not in the test. Tests documenting
+known library failures begin with a `TEST_IGNORE_MESSAGE()` describing the
+defect, so a run is green. Fixing the defect includes deleting that line. A
+change must not make any test fail.
 
-To compare two runs, list the tests that failed in each:
+To list what is still ignored:
 
 ```
-pio test -e native | awk -F': ' '/\[FAILED\]/ { print $2 }' | sort -u
+pio test -e native -v | grep ':IGNORE:'
 ```
 
 ## Why each test is forked
