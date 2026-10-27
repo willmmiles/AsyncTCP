@@ -1,10 +1,10 @@
 # Host-native test harness
 
-Compiles `src/AsyncTCP.cpp` for the host against mock lwIP, FreeRTOS and Arduino
-headers, so the library's logic can be exercised on a desktop with no ESP32 and
-no network.
+The harness compiles `src/AsyncTCP.cpp` for the host against mock lwIP, FreeRTOS
+and Arduino headers, so the library's logic can be exercised on a desktop with no
+ESP32 and no network.
 
-Nothing under `src/` is modified or needs to be.
+It needs no changes to anything under `src/`.
 
 ## Running
 
@@ -15,9 +15,9 @@ pio test -e native-no-ipv6          # ... against lwIP built for IPv4 only
 pio test -e native-no-core-locking  # ... against lwIP without core locking
 ```
 
-Each reports each test separately and exits non-zero if any fails. The two
-lwIP configurations change address layout and locking, not who owns what, so
-they run without the sanitizers.
+Each environment reports every test separately, and `pio test` exits non-zero if
+any test fails. The two lwIP configurations change address layout and locking,
+not who owns what, so they run without the sanitizers.
 
 To work under a debugger, run the built program directly;
 `ASYNCTCP_TEST_NOFORK=1` keeps every test in one process:
@@ -28,8 +28,8 @@ ASYNCTCP_TEST_NOFORK=1 gdb .pio/build/native/program
 
 `ASYNCTCP_TEST_VERBOSE=1` additionally prints the library's `log_*` output.
 
-Unity's own options select tests; `-h` lists them. Through `pio test`, pass each as one
-`-a`, joined by `=`:
+Unity's own options select which tests run; `-h` lists them. To pass one through
+`pio test`, give it as a single `-a` argument, with any value joined by `=`:
 
 ```
 pio test -e native -a -f=test_dns_     # only tests whose name contains test_dns_
@@ -52,23 +52,24 @@ pio test -e native -v | grep ':IGNORE:'
 
 ## Why each test is forked
 
-`test_main.cpp` runs every test in a child process. A test that segfaults then
+`test_main.cpp` runs every test in a child process, so a test that segfaults
 costs one red result instead of the rest of the run -- which matters, because the
-bugs this suite is aimed at tend to crash rather than to fail an assertion. It
-also lets `tearDown()` run LeakSanitizer's check on one test at a time, so a
+bugs this suite is aimed at tend to crash rather than to fail an assertion.
+Forking also lets `tearDown()` run LeakSanitizer's check on one test at a time, so a
 leak fails the test that caused it.
 
 ## How a failed assertion ends a test
 
 `unity_config.h` makes Unity's `TEST_ABORT()` throw, and `test_main.cpp` catches
 that around the test, `setUp()` and `tearDown()`. So a failed assertion ends the
-test on the spot, as it would with Unity's default `longjmp`, but its destructors
-run and `tearDown()` still does. That holds inside a callback run by a pump too.
+test on the spot, as it would with Unity's default `longjmp`, but the test's
+destructors still run, and so does `tearDown()`. The same is true of a failed
+assertion in a callback that a pump runs.
 
 Where nothing can be unwound -- a failed assertion in a callback run from a
-destructor, which is `noexcept` -- the throw ends in `std::terminate()`. The
-forked child concludes the test as failed there; under `ASYNCTCP_TEST_NOFORK=1`
-it ends the run.
+destructor, which is `noexcept` -- the throw ends in `std::terminate()`. In a
+forked child, the runner's terminate handler then records the test as failed;
+under `ASYNCTCP_TEST_NOFORK=1`, the whole run ends.
 
 ## How the async task is pumped
 
@@ -119,7 +120,7 @@ test/test_native/
   asynctcp.cpp          the library under test, compiled into the test program
   fixtures.h            what most tests share: the peer and ports, establish(),
                         listen_pcb(), AppCall, Recorder, Accepted
-  tests/                one file per topic; add files here, they are picked up
+  tests/                one file per topic; new files here are picked up automatically
     test_client.cpp         end-to-end smoke tests, one per main path
     test_state.cpp          the connection state machine and the accessors
     test_write.cpp          the outbound path
@@ -153,7 +154,7 @@ test/test_native/
 
 ## What the mock lwIP models
 
-Behavior is matched to real lwIP wherever AsyncTCP's lifetime handling depends
+The mock behaves as real lwIP does wherever AsyncTCP's lifetime handling depends
 on it:
 
 * `tcp_abort()` frees the pcb and **then** invokes the error callback with
@@ -190,13 +191,14 @@ on it:
 without it, lwIP runs `fn` on its own thread, and there is no core lock at all,
 so `LOCK_TCPIP_CORE()` is empty and the raw API is safe only on the lwIP thread.
 
-Inside `tcpip_api_call()` and the `fire_*` helpers the mock counts as the lwIP
-thread. After every test the runner fails it if the library:
+The mock treats code running inside `tcpip_api_call()` or a `fire_*` helper as
+running on the lwIP thread. After every test, the runner fails that test if the
+library:
 
 * called `tcpip_api_call()` from the lwIP thread, which would deadlock;
 * left the TCPIP core lock held;
 * called any `tcp_*` or `dns_*` function neither on the lwIP thread nor under
-  the core lock, which would race the lwIP thread.
+  the core lock, which would race the lwIP thread;
 * returned `ERR_ABRT` from a callback for a pcb it had not aborted, or anything
   else for one it had, which would leave lwIP using a freed pcb or dropping a live
   one.
@@ -209,9 +211,10 @@ plain `ip4_addr_t` with no `type` or `u_addr`.
 
 ## Adding a test
 
-Add it to the file for its topic, or drop a new `.cpp` in `tests/`; PlatformIO
-compiles everything under this directory. The tests are plain Unity, and each
-file lists what it holds in one `run_*_tests()`:
+Add a new test to the file for its topic, or put it in a new `.cpp` file in
+`tests/`; PlatformIO compiles everything under this directory. The tests are
+plain Unity, and each file registers its tests in a single `run_*_tests()`
+function:
 
 ```cpp
 #include "fixtures.h"
@@ -241,9 +244,9 @@ Include `fixtures.h`, or at least `runner.h`, rather than `<unity.h>`: `runner.h
 is what redirects `RUN_TEST` into the forking runner. A new file's
 `run_*_tests()` has to be declared and called in `test_main.cpp`.
 
-Every configuration builds every test, so a test about IPv6 goes inside
-`#if LWIP_IPV6`, and addresses are read through `remote_ip4(pcb)` rather than
-the fields of `ip_addr_t`, whose layout depends on it.
+Every configuration builds every test, so tests about IPv6 should go inside
+`#if LWIP_IPV6`, and tests should read addresses through `remote_ip4(pcb)`
+rather than the fields of `ip_addr_t`, whose layout depends on `LWIP_IPV6`.
 
 `fixtures.h` holds what most tests start with:
 
@@ -253,20 +256,20 @@ the fields of `ip_addr_t`, whose layout depends on it.
 * `listen_pcb(port)`: the listening pcb, on `port` or on any port;
 * `Recorder`: records a client's callbacks as a string, one letter each, so
   order, count and exactly-once are one assertion;
-* `AppCall`, `app()`, `app_close()`, `app_abort()`, `app_delete()`: mark a call
-  the application makes into the library, so a `Recorder` notes in
-  `violations` any callback run inside it that the call may not run;
+* `AppCall`, `app()`, `app_close()`, `app_abort()`, `app_delete()`: mark the span
+  of an application call into the library. A `Recorder` adds to `violations`
+  any callback that runs during that span but that the call may not run;
 * `Accepted`: takes delivery of a server's clients and deletes whatever is left
   of them at scope exit.
 
 `python3 test/check_registration.py` (run by pre-commit and CI) fails if a test
 is never registered, or is not named for its file: tests in `test_topic.cpp`
-are `test_topic_*`.
+must be named `test_topic_*`.
 
 `test_main.cpp` calls `mocklwip::reset()`, `mockrtos::reset()`, `mockclock::reset()`
 and `mockalloc::reset()` before every test, and `mocklwip::reset()` again after, so
 each test starts from zero pcbs, zero pbufs, no faults and `millis() == 1000`. A
-test about `millis() == 0` sets it with `mockclock::set_millis(0)`.
+test that needs `millis() == 0` should set it with `mockclock::set_millis(0)`.
 
 **Destroy your `AsyncClient`/`AsyncServer` before the test returns** if you want
 leak assertions to mean anything — `reset()` reclaims whatever is left, but a
@@ -360,12 +363,12 @@ mockclock::advance(1500)  // move millis() forward
 * `reset()` cannot un-start the library's async task or free its queue mutex;
   those are process-lifetime singletons in `src/AsyncTCP.cpp`. Under the default
   fork-per-test that costs nothing; under `ASYNCTCP_TEST_NOFORK=1` they persist
-  from one test to the next, so the tests in `test_start.cpp` that fail their
-  creation only mean anything as the first to start the library.
+  from one test to the next, so the tests in `test_start.cpp` that make creating
+  them fail are meaningful only when they are the first to start the library.
 * The mocks cover the API surface `src/AsyncTCP.cpp` actually uses. A change that
   reaches for more of lwIP will need them extended to match.
 * Forking is POSIX-only; elsewhere the tests run in one process and a crash ends
   the run.
-* Memory the library reads before writing holds 0xfe bytes, on the stack and on
-  the heap, so a failure that depends on it reads the same on every run. The
-  heap fill needs glibc or ASan.
+* The harness fills new stack and heap memory with 0xfe bytes, so if the library
+  reads memory before writing it, the test gets the same result on every run.
+  The heap fill needs glibc or ASan.
